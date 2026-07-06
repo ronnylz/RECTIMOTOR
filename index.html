@@ -2,19 +2,11 @@
 <html lang="es">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover">
 <title>RectiMotor · Gestión de Taller</title>
-<meta name="description" content="Control de órdenes de trabajo, tiempos de mecanizado, cajones y repuestos para talleres de rectificación de motores.">
-<meta name="theme-color" content="#191c20">
-<meta name="mobile-web-app-capable" content="yes">
-<meta name="apple-mobile-web-app-capable" content="yes">
-<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
-<meta name="apple-mobile-web-app-title" content="RectiMotor">
-<link rel="manifest" href="manifest.json">
-<link rel="icon" href="icon-192.png" sizes="192x192" type="image/png">
-<link rel="apple-touch-icon" href="icon-192.png">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600;700&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+<script src="https://cdn.jsdelivr.net/npm/@emailjs/browser@4/dist/email.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
 <style>
   :root{
     --bg:#191c20;
@@ -168,6 +160,24 @@
 <div id="app"></div>
 
 <script>
+/* ==== CONFIGURACIÓN DE EMAILJS (recuperación de contraseña por correo) ====
+   Reemplaza estos 3 valores con los de tu cuenta gratuita en emailjs.com
+   Mientras digan "TU_...", el botón de enviar por correo mostrará un aviso
+   en vez de intentar enviar. */
+const EMAILJS_PUBLIC_KEY  = 'TU_PUBLIC_KEY';
+const EMAILJS_SERVICE_ID  = 'TU_SERVICE_ID';
+const EMAILJS_TEMPLATE_ID = 'TU_TEMPLATE_ID';
+const EMAILJS_CONFIGURADO = !EMAILJS_PUBLIC_KEY.startsWith('TU_') && !EMAILJS_SERVICE_ID.startsWith('TU_') && !EMAILJS_TEMPLATE_ID.startsWith('TU_');
+if(EMAILJS_CONFIGURADO && window.emailjs){ window.emailjs.init(EMAILJS_PUBLIC_KEY); }
+
+const PREGUNTAS_SEGURIDAD = [
+  '¿Cuál es el nombre de tu primera mascota?',
+  '¿En qué ciudad naciste?',
+  '¿Cuál es tu comida favorita?',
+  '¿Cómo se llama tu mejor amigo de la infancia?',
+  '¿Cuál fue el modelo de tu primer carro?'
+];
+
 const TIPOS_TRABAJO = {
   culata:{ label:'Cabezotes', procesos:['Prueba de fisuras','Planificado de superficie','Rectificado de asientos de válvulas','Cambio de guías','Ajuste de resortes de válvula'] },
   cigueñal:{ label:'Cigüeñal', procesos:['Rectificado de muñones de biela','Rectificado de muñones de bancada','Pulido final','Balanceo dinámico'] },
@@ -223,10 +233,12 @@ let state = {
   orders:[],
   inventory:[],
   users:[],
+  taller:{nombre:'RectiMotor', telefono:'', direccion:'', codigoPais:''},
   counters:{order:0},
   loaded:false,
   currentUser:null,
   loginForm:{usuario:'', password:'', error:''},
+  recovery:null, // {step:'find'|'answer'|'reset', usuario:'', user:null, error:''}
   openOrderIds:new Set(),
   modal:null, // {type:'order'|'inventory'|'user'|'photo', draft:{...}, editingId}
   photoCache:{},      // trabajoId -> dataURL, fetched on demand
@@ -246,9 +258,11 @@ async function loadAll(){
   try{ const r = await window.storage.get('inventory', false); state.inventory = r ? JSON.parse(r.value) : []; }catch(e){ state.inventory = []; }
   try{ const r = await window.storage.get('counters', false); state.counters = r ? JSON.parse(r.value) : {order:0}; }catch(e){ state.counters = {order:0}; }
   try{ const r = await window.storage.get('users', false); state.users = r ? JSON.parse(r.value) : []; }catch(e){ state.users = []; }
+  try{ const r = await window.storage.get('taller', false); state.taller = r ? JSON.parse(r.value) : {nombre:'RectiMotor', telefono:'', direccion:'', codigoPais:''}; }catch(e){ state.taller = {nombre:'RectiMotor', telefono:'', direccion:'', codigoPais:''}; }
   state.loaded = true;
 }
 async function saveUsers(){ try{ await window.storage.set('users', JSON.stringify(state.users), false); }catch(e){ console.error('Error guardando usuarios', e); } }
+async function saveTaller(){ try{ await window.storage.set('taller', JSON.stringify(state.taller), false); }catch(e){ console.error('Error guardando datos del taller', e); } }
 async function saveOrders(){ try{ await window.storage.set('orders', JSON.stringify(state.orders), false); }catch(e){ console.error('Error guardando órdenes', e); } }
 async function saveInventory(){ try{ await window.storage.set('inventory', JSON.stringify(state.inventory), false); }catch(e){ console.error('Error guardando inventario', e); } }
 async function saveCounters(){ try{ await window.storage.set('counters', JSON.stringify(state.counters), false); }catch(e){ console.error('Error guardando contador', e); } }
@@ -312,6 +326,130 @@ function orderTotal(o){
   return repSum + (Number(o.manoObra)||0);
 }
 function lowStockItems(){ return state.inventory.filter(i => Number(i.stock) <= Number(i.stockMinimo)); }
+
+function generateOrderPDF(order){
+  if(!window.jspdf || !window.jspdf.jsPDF){ alert('No se pudo cargar el generador de PDF. Revisa tu conexión a internet e intenta de nuevo.'); return; }
+  const { jsPDF } = window.jspdf;
+  const doc = new jsPDF({unit:'mm', format:'a4'});
+  const marginX = 16;
+  let y = 18;
+  const pageW = doc.internal.pageSize.getWidth();
+
+  doc.setFont('helvetica','bold'); doc.setFontSize(15);
+  doc.text(state.taller.nombre || 'RectiMotor', marginX, y);
+  doc.setFont('helvetica','normal'); doc.setFontSize(9); doc.setTextColor(90);
+  y += 6;
+  if(state.taller.direccion){ doc.text(state.taller.direccion, marginX, y); y += 5; }
+  if(state.taller.telefono){ doc.text('Tel: ' + state.taller.telefono, marginX, y); y += 5; }
+  doc.setTextColor(0);
+
+  doc.setFont('helvetica','bold'); doc.setFontSize(12);
+  doc.text('Orden de trabajo ' + order.folio, pageW - marginX, 18, {align:'right'});
+  doc.setFont('helvetica','normal'); doc.setFontSize(9);
+  doc.text('Fecha: ' + fmtDate(order.fechaIngreso), pageW - marginX, 24, {align:'right'});
+  doc.text('Estado: ' + ESTADO_LABEL[order.estado], pageW - marginX, 29, {align:'right'});
+
+  y += 6;
+  doc.setDrawColor(200); doc.line(marginX, y, pageW-marginX, y); y += 8;
+
+  doc.setFont('helvetica','bold'); doc.setFontSize(10);
+  doc.text('Cliente', marginX, y);
+  doc.text('Vehículo', pageW/2 + 4, y);
+  y += 5;
+  doc.setFont('helvetica','normal'); doc.setFontSize(9);
+  doc.text(order.cliente.nombre || '—', marginX, y);
+  doc.text([order.vehiculo.marca, order.vehiculo.modelo, order.vehiculo.anio].filter(Boolean).join(' '), pageW/2 + 4, y);
+  y += 5;
+  doc.text(order.cliente.telefono || '', marginX, y);
+  doc.text(order.vehiculo.motor ? ('Motor: ' + order.vehiculo.motor) : '', pageW/2 + 4, y);
+  y += 5;
+  doc.text('Técnico: ' + (order.tecnico || '—'), marginX, y);
+  doc.text('Cajón: ' + (order.ubicacion || '—'), pageW/2 + 4, y);
+  y += 10;
+
+  order.trabajos.forEach(t=>{
+    if(y > 265){ doc.addPage(); y = 18; }
+    doc.setFont('helvetica','bold'); doc.setFontSize(10);
+    doc.setFillColor(235,235,235);
+    doc.rect(marginX, y-4.5, pageW-marginX*2, 6.5, 'F');
+    doc.text(TIPOS_TRABAJO[t.tipo].label + (t.ubicacion? '  ·  Cajón: '+t.ubicacion : ''), marginX+2, y);
+    y += 7;
+    doc.setFont('helvetica','normal'); doc.setFontSize(9);
+    t.procesos.forEach(p=>{
+      if(y > 270){ doc.addPage(); y = 18; }
+      const estadoTxt = p.estado==='terminado' ? 'Terminado' : (p.estado==='en_proceso' ? 'En proceso' : 'Pendiente');
+      doc.text('• ' + p.nombre, marginX+2, y);
+      doc.text(estadoTxt, pageW - marginX - 30, y);
+      doc.text(fmtSecs(p.tiempoRealSeg), pageW - marginX, y, {align:'right'});
+      y += 5;
+    });
+    if(t.medidas){ doc.setFont('helvetica','italic'); doc.text('Medidas: ' + t.medidas, marginX+2, y); doc.setFont('helvetica','normal'); y += 6; }
+    else y += 2;
+  });
+
+  if(order.repuestos.length){
+    if(y > 250){ doc.addPage(); y = 18; }
+    y += 4;
+    doc.setFont('helvetica','bold'); doc.setFontSize(10);
+    doc.setFillColor(235,235,235);
+    doc.rect(marginX, y-4.5, pageW-marginX*2, 6.5, 'F');
+    doc.text('Repuestos utilizados', marginX+2, y);
+    y += 7;
+    doc.setFont('helvetica','normal'); doc.setFontSize(9);
+    order.repuestos.forEach(r=>{
+      if(y > 270){ doc.addPage(); y = 18; }
+      doc.text(r.nombre + ' x' + r.cantidad, marginX+2, y);
+      doc.text(fmtMoney(r.cantidad*r.precioUnitario), pageW - marginX, y, {align:'right'});
+      y += 5;
+    });
+  }
+
+  y += 6;
+  if(y > 265){ doc.addPage(); y = 18; }
+  doc.setDrawColor(200); doc.line(marginX, y, pageW-marginX, y); y += 8;
+  const repSubtotal = order.repuestos.reduce((a,r)=>a+r.cantidad*r.precioUnitario,0);
+  doc.setFontSize(9);
+  doc.text('Mano de obra:', pageW - marginX - 50, y);
+  doc.text(fmtMoney(order.manoObra), pageW - marginX, y, {align:'right'}); y += 5;
+  doc.text('Repuestos:', pageW - marginX - 50, y);
+  doc.text(fmtMoney(repSubtotal), pageW - marginX, y, {align:'right'}); y += 6;
+  doc.setFont('helvetica','bold'); doc.setFontSize(11);
+  doc.text('Total:', pageW - marginX - 50, y);
+  doc.text(fmtMoney(orderTotal(order)), pageW - marginX, y, {align:'right'});
+
+  if(order.notas){
+    y += 10;
+    if(y > 265){ doc.addPage(); y = 18; }
+    doc.setFont('helvetica','bold'); doc.setFontSize(9);
+    doc.text('Notas:', marginX, y); y += 5;
+    doc.setFont('helvetica','normal');
+    const lines = doc.splitTextToSize(order.notas, pageW - marginX*2);
+    doc.text(lines, marginX, y);
+  }
+
+  doc.save('Orden-' + order.folio + '.pdf');
+}
+
+function normalizePhoneForWhatsapp(phone){
+  let digits = (phone||'').replace(/\D/g,'');
+  if(!digits) return null;
+  if(digits.length <= 8 && state.taller.codigoPais){ digits = state.taller.codigoPais.replace(/\D/g,'') + digits; }
+  return digits;
+}
+
+function notifyClientWhatsApp(order){
+  const digits = normalizePhoneForWhatsapp(order.cliente.telefono);
+  if(!digits){ alert('Esta orden no tiene un teléfono de cliente válido.'); return; }
+  const vehiculo = [order.vehiculo.marca, order.vehiculo.modelo].filter(Boolean).join(' ');
+  let mensaje;
+  if(order.estado==='terminado' || order.estado==='entregado'){
+    mensaje = `Hola ${order.cliente.nombre||''}, te escribimos de ${state.taller.nombre||'RectiMotor'} para avisarte que tu ${vehiculo||'vehículo'} (orden ${order.folio}) ya está listo para retirar. ¡Te esperamos!`;
+  } else {
+    mensaje = `Hola ${order.cliente.nombre||''}, te escribimos de ${state.taller.nombre||'RectiMotor'} sobre tu orden ${order.folio} (${vehiculo||'vehículo'}). Estado actual: ${ESTADO_LABEL[order.estado]}.`;
+  }
+  const url = 'https://wa.me/' + digits + '?text=' + encodeURIComponent(mensaje);
+  window.open(url, '_blank');
+}
 
 function fetchPhotoIntoCache(trabajoId){
   if(state.photoCache[trabajoId] || state.photoFetching.has(trabajoId) || state.pendingPhotos[trabajoId]) return;
@@ -384,6 +522,11 @@ function render(){
     return;
   }
   if(!state.currentUser){
+    if(state.recovery){
+      app.innerHTML = renderRecoveryScreen();
+      bindRecoveryEvents();
+      return;
+    }
     app.innerHTML = renderLoginScreen();
     bindLoginEvents();
     return;
@@ -398,6 +541,7 @@ function render(){
       <div class="nav-item ${state.tab==='orders'?'active':''}" data-nav="orders"><span class="nav-icon">▤</span> Órdenes de trabajo</div>
       <div class="nav-item ${state.tab==='search'?'active':''}" data-nav="search"><span class="nav-icon">⌕</span> Buscar piezas / cajones</div>
       <div class="nav-item ${state.tab==='inventory'?'active':''}" data-nav="inventory"><span class="nav-icon">▥</span> Inventario</div>
+      ${state.currentUser.rol==='admin' ? `<div class="nav-item ${state.tab==='reports'?'active':''}" data-nav="reports"><span class="nav-icon">▦</span> Reportes</div>` : ''}
       ${state.currentUser.rol==='admin' ? `<div class="nav-item ${state.tab==='users'?'active':''}" data-nav="users"><span class="nav-icon">☺</span> Usuarios</div>` : ''}
       <div class="sidebar-footer">
         <div class="user-badge">${state.currentUser.nombre} <span class="role-pill ${state.currentUser.rol==='admin'?'admin':''}">${state.currentUser.rol==='admin'?'Admin':'Técnico'}</span></div>
@@ -405,6 +549,7 @@ function render(){
         <span class="reset-link" id="export-btn" style="color:var(--accent);">Exportar datos</span>
         ${state.currentUser.rol==='admin' ? ` · <span class="reset-link" id="import-btn" style="color:var(--accent);">Importar datos</span>` : ''}
         <br>
+        ${state.currentUser.rol==='admin' ? `<span class="reset-link" id="taller-btn" style="color:var(--accent);">Datos del taller</span><br>` : ''}
         <input type="file" id="import-file-input" accept="application/json" hidden>
         ${state.currentUser.rol==='admin' ? `<span class="reset-link" id="reset-btn">Borrar todos los datos</span><br>` : ''}
         <span class="reset-link" id="logout-btn" style="color:var(--text-dim);">Cerrar sesión</span>
@@ -430,12 +575,15 @@ function render(){
   const importInput = document.getElementById('import-file-input');
   if(importInput) importInput.onchange = function(){ handleImportFile(this); };
   document.getElementById('logout-btn').onclick = logout;
+  const tallerBtn = document.getElementById('taller-btn');
+  if(tallerBtn) tallerBtn.onclick = ()=>{ state.modal = {type:'taller', draft: JSON.parse(JSON.stringify(state.taller))}; render(); };
 
   const content = document.getElementById('content');
   if(state.tab==='dashboard') content.innerHTML = renderDashboard();
   else if(state.tab==='orders') content.innerHTML = renderOrders();
   else if(state.tab==='search') content.innerHTML = renderSearch();
   else if(state.tab==='inventory') content.innerHTML = renderInventory();
+  else if(state.tab==='reports') content.innerHTML = state.currentUser.rol==='admin' ? renderReports() : emptyState('Acceso restringido','Solo un administrador puede ver esta sección.');
   else if(state.tab==='users') content.innerHTML = state.currentUser.rol==='admin' ? renderUsers() : emptyState('Acceso restringido','Solo un administrador puede ver esta sección.');
 
   bindContentEvents();
@@ -443,7 +591,7 @@ function render(){
 }
 
 function tabTitle(){
-  return {dashboard:'Panel general', orders:'Órdenes de trabajo', search:'Buscar piezas y cajones', inventory:'Inventario de repuestos', users:'Usuarios'}[state.tab];
+  return {dashboard:'Panel general', orders:'Órdenes de trabajo', search:'Buscar piezas y cajones', inventory:'Inventario de repuestos', reports:'Reportes', users:'Usuarios'}[state.tab];
 }
 
 /* ---------------- AUTENTICACIÓN ---------------- */
@@ -456,8 +604,15 @@ function renderSetupScreen(){
       <p style="font-size:13px;color:var(--text-dim);margin-bottom:16px;">Crea la cuenta de administrador. Esta persona será la única que pueda borrar todos los datos y gestionar usuarios.</p>
       <div class="field" style="margin-bottom:10px;"><label>Nombre completo</label><input id="su-nombre"></div>
       <div class="field" style="margin-bottom:10px;"><label>Usuario</label><input id="su-usuario" placeholder="ej. admin"></div>
+      <div class="field" style="margin-bottom:10px;"><label>Correo electrónico (para recuperar tu contraseña)</label><input type="email" id="su-correo" placeholder="tucorreo@gmail.com"></div>
       <div class="field" style="margin-bottom:10px;"><label>Contraseña</label><input type="password" id="su-password"></div>
       <div class="field" style="margin-bottom:16px;"><label>Confirmar contraseña</label><input type="password" id="su-password2"></div>
+      <hr class="divider">
+      <p style="font-size:12px;color:var(--text-dim);margin-bottom:10px;">Esto se usará para recuperar la contraseña si la olvidas.</p>
+      <div class="field" style="margin-bottom:10px;"><label>Pregunta de seguridad</label>
+        <select id="su-pregunta">${PREGUNTAS_SEGURIDAD.map(p=>`<option>${p}</option>`).join('')}</select>
+      </div>
+      <div class="field" style="margin-bottom:16px;"><label>Respuesta</label><input id="su-respuesta"></div>
       <div id="su-error" class="auth-error"></div>
       <button class="btn btn-primary" style="width:100%;" id="su-submit">Crear administrador y entrar</button>
     </div>
@@ -472,7 +627,11 @@ function bindSetupEvents(){
     const errEl = document.getElementById('su-error');
     if(!nombre || !usuario || !pass){ errEl.textContent = 'Completa todos los campos.'; return; }
     if(pass !== pass2){ errEl.textContent = 'Las contraseñas no coinciden.'; return; }
-    const user = {id:uid(), nombre, usuario, password:pass, rol:'admin'};
+    const respuesta = val('su-respuesta').trim();
+    if(!respuesta){ errEl.textContent = 'Ingresa una respuesta a la pregunta de seguridad.'; return; }
+    const pregunta = val('su-pregunta');
+    const correo = val('su-correo').trim();
+    const user = {id:uid(), nombre, usuario, password:pass, rol:'admin', pregunta, respuesta, correo};
     state.users.push(user);
     await saveUsers();
     state.currentUser = user;
@@ -490,6 +649,7 @@ function renderLoginScreen(){
       <div class="field" style="margin-bottom:16px;"><label>Contraseña</label><input type="password" id="li-password"></div>
       <div id="li-error" class="auth-error">${state.loginForm.error||''}</div>
       <button class="btn btn-primary" style="width:100%;" id="li-submit">Entrar</button>
+      <div style="text-align:center;margin-top:12px;"><span class="reset-link" id="forgot-link" style="color:var(--accent);font-size:12px;">¿Olvidaste tu contraseña?</span></div>
     </div>
   </div>`;
 }
@@ -506,8 +666,148 @@ function bindLoginEvents(){
   document.getElementById('li-submit').onclick = doLogin;
   document.getElementById('li-password').onkeydown = (e)=>{ if(e.key==='Enter') doLogin(); };
   document.getElementById('li-usuario').onkeydown = (e)=>{ if(e.key==='Enter') doLogin(); };
+  document.getElementById('forgot-link').onclick = ()=>{ state.recovery = {step:'find', usuario:'', user:null, error:''}; render(); };
 }
 function logout(){ state.currentUser = null; state.tab='dashboard'; render(); }
+
+/* ---------------- RECUPERAR CONTRASEÑA ---------------- */
+function renderRecoveryScreen(){
+  const r = state.recovery;
+  let body = '';
+  if(r.step==='find'){
+    body = `
+      <p style="font-size:13px;color:var(--text-dim);margin-bottom:16px;">Escribe tu usuario para recuperar tu contraseña.</p>
+      <div class="field" style="margin-bottom:14px;"><label>Usuario</label><input id="rc-usuario" value="${r.usuario}"></div>
+      <div id="rc-error" class="auth-error">${r.error||''}</div>
+      <button class="btn btn-primary" style="width:100%;margin-bottom:8px;" id="rc-find-btn">Buscar usuario</button>
+      <button class="btn" style="width:100%;" id="rc-cancel-btn">Volver a iniciar sesión</button>
+    `;
+  } else if(r.step==='choose'){
+    body = `
+      <p style="font-size:13px;color:var(--text-dim);margin-bottom:16px;">Hola <b>${r.user.nombre}</b>, ¿cómo quieres recuperar tu contraseña?</p>
+      ${r.user.correo ? `<button class="btn btn-primary" style="width:100%;margin-bottom:8px;" id="rc-email-btn">Enviarme una contraseña temporal a ${maskEmail(r.user.correo)}</button>` : ''}
+      ${(r.user.pregunta && r.user.respuesta) ? `<button class="btn" style="width:100%;margin-bottom:8px;" id="rc-question-btn">Responder mi pregunta de seguridad</button>` : ''}
+      <div id="rc-error" class="auth-error"></div>
+      <button class="btn" style="width:100%;" id="rc-cancel-btn">Volver a iniciar sesión</button>
+    `;
+  } else if(r.step==='answer'){
+    body = `
+      <p style="font-size:13px;color:var(--text-dim);margin-bottom:6px;">Pregunta de seguridad de <b>${r.user.nombre}</b>:</p>
+      <p style="font-size:14px;margin-bottom:16px;">${r.user.pregunta}</p>
+      <div class="field" style="margin-bottom:14px;"><label>Respuesta</label><input id="rc-respuesta"></div>
+      <div id="rc-error" class="auth-error">${r.error||''}</div>
+      <button class="btn btn-primary" style="width:100%;margin-bottom:8px;" id="rc-answer-btn">Verificar</button>
+      <button class="btn" style="width:100%;" id="rc-cancel-btn">Volver a iniciar sesión</button>
+    `;
+  } else if(r.step==='sent'){
+    body = `
+      <p style="font-size:14px;margin-bottom:16px;">✅ Te enviamos una contraseña temporal a <b>${r.user.correo}</b>. Revisa tu bandeja de entrada (y spam) e inicia sesión con ella.</p>
+      <button class="btn btn-primary" style="width:100%;" id="rc-cancel-btn">Volver a iniciar sesión</button>
+    `;
+  } else if(r.step==='reset'){
+    body = `
+      <p style="font-size:13px;color:var(--text-dim);margin-bottom:16px;">Respuesta correcta. Define una nueva contraseña para <b>${r.user.nombre}</b>.</p>
+      <div class="field" style="margin-bottom:10px;"><label>Nueva contraseña</label><input type="password" id="rc-pass1"></div>
+      <div class="field" style="margin-bottom:16px;"><label>Confirmar contraseña</label><input type="password" id="rc-pass2"></div>
+      <div id="rc-error" class="auth-error"></div>
+      <button class="btn btn-primary" style="width:100%;margin-bottom:8px;" id="rc-reset-btn">Guardar nueva contraseña</button>
+      <button class="btn" style="width:100%;" id="rc-cancel-btn">Cancelar</button>
+    `;
+  }
+  return `
+  <div class="auth-wrap">
+    <div class="auth-card">
+      <div class="brand-mark" style="text-align:center;margin-bottom:4px;">RECTI<span>MOTOR</span></div>
+      <div class="brand-sub" style="text-align:center;margin-bottom:18px;">Recuperar contraseña</div>
+      ${body}
+    </div>
+  </div>`;
+}
+
+function maskEmail(email){
+  const [user, domain] = email.split('@');
+  if(!domain) return email;
+  const visible = user.slice(0,2);
+  return visible + '***@' + domain;
+}
+
+function genTempPassword(){
+  const chars = 'ABCDEFGHJKMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz23456789';
+  let out = '';
+  for(let i=0;i<8;i++) out += chars[Math.floor(Math.random()*chars.length)];
+  return out;
+}
+
+async function sendRecoveryEmail(user){
+  const errEl = document.getElementById('rc-error');
+  if(!EMAILJS_CONFIGURADO || !window.emailjs){
+    if(errEl) errEl.textContent = 'El envío de correo aún no está configurado en esta app. Usa la pregunta de seguridad o pide ayuda a un administrador.';
+    return;
+  }
+  const btn = document.getElementById('rc-email-btn');
+  if(btn){ btn.disabled = true; btn.textContent = 'Enviando…'; }
+  const tempPass = genTempPassword();
+  try{
+    await window.emailjs.send(EMAILJS_SERVICE_ID, EMAILJS_TEMPLATE_ID, {
+      to_email: user.correo,
+      to_name: user.nombre,
+      temp_password: tempPass
+    });
+    const idx = state.users.findIndex(u=>u.id===user.id);
+    if(idx>=0){ state.users[idx].password = tempPass; await saveUsers(); }
+    state.recovery = {step:'sent', usuario:user.usuario, user, error:''};
+    render();
+  }catch(e){
+    console.error('Error enviando correo de recuperación', e);
+    if(errEl) errEl.textContent = 'No se pudo enviar el correo. Verifica tu conexión o intenta con la pregunta de seguridad.';
+    if(btn){ btn.disabled = false; btn.textContent = 'Enviarme una contraseña temporal a ' + maskEmail(user.correo); }
+  }
+}
+
+function bindRecoveryEvents(){
+  const r = state.recovery;
+  const cancelBtn = document.getElementById('rc-cancel-btn');
+  if(cancelBtn) cancelBtn.onclick = ()=>{ state.recovery = null; render(); };
+
+  if(r.step==='find'){
+    document.getElementById('rc-find-btn').onclick = ()=>{
+      const usuario = val('rc-usuario').trim();
+      const user = state.users.find(u=>u.usuario.toLowerCase()===usuario.toLowerCase());
+      if(!user){ r.usuario = usuario; r.error = 'No existe ese usuario.'; render(); return; }
+      if(!user.correo && !(user.pregunta && user.respuesta)){ r.usuario = usuario; r.error = 'Este usuario no tiene correo ni pregunta de seguridad configurados. Pide a un administrador que le restablezca la contraseña desde la sección Usuarios.'; render(); return; }
+      state.recovery = {step:'choose', usuario, user, error:''};
+      render();
+    };
+  }
+  if(r.step==='choose'){
+    const emailBtn = document.getElementById('rc-email-btn');
+    if(emailBtn) emailBtn.onclick = ()=> sendRecoveryEmail(r.user);
+    const questionBtn = document.getElementById('rc-question-btn');
+    if(questionBtn) questionBtn.onclick = ()=>{ state.recovery = {step:'answer', usuario:r.usuario, user:r.user, error:''}; render(); };
+  }
+  if(r.step==='answer'){
+    document.getElementById('rc-answer-btn').onclick = ()=>{
+      const resp = val('rc-respuesta').trim().toLowerCase();
+      if(resp !== r.user.respuesta.trim().toLowerCase()){ r.error = 'Respuesta incorrecta.'; render(); return; }
+      state.recovery = {step:'reset', usuario:r.usuario, user:r.user, error:''};
+      render();
+    };
+  }
+  if(r.step==='reset'){
+    document.getElementById('rc-reset-btn').onclick = async ()=>{
+      const p1 = val('rc-pass1'), p2 = val('rc-pass2');
+      const errEl = document.getElementById('rc-error');
+      if(!p1){ errEl.textContent = 'Ingresa la nueva contraseña.'; return; }
+      if(p1!==p2){ errEl.textContent = 'Las contraseñas no coinciden.'; return; }
+      const idx = state.users.findIndex(u=>u.id===r.user.id);
+      if(idx>=0){ state.users[idx].password = p1; await saveUsers(); }
+      state.recovery = null;
+      state.loginForm = {usuario:r.usuario, password:'', error:''};
+      alert('Contraseña actualizada. Ya puedes iniciar sesión.');
+      render();
+    };
+  }
+}
 
 /* ---------------- DASHBOARD ---------------- */
 function renderDashboard(){
@@ -587,6 +887,8 @@ function renderOrderCard(o){
       <div style="margin-top:8px;font-family:var(--mono);font-size:14px;">Total estimado: <b>${fmtMoney(orderTotal(o))}</b></div>
       <div class="order-actions">
         <button class="btn btn-sm" data-edit="${o.id}">Editar</button>
+        <button class="btn btn-sm" data-pdf="${o.id}">📄 Comprobante PDF</button>
+        ${o.cliente.telefono ? `<button class="btn btn-sm" data-notify="${o.id}">📲 Notificar cliente</button>` : ''}
         <button class="btn btn-sm btn-danger" data-del="${o.id}">Eliminar</button>
       </div>
     </div>
@@ -654,6 +956,107 @@ function renderInventory(){
   `;
 }
 
+/* ---------------- REPORTES (solo admin) ---------------- */
+const MESES_LARGO = ['enero','febrero','marzo','abril','mayo','junio','julio','agosto','septiembre','octubre','noviembre','diciembre'];
+
+function buildReportData(){
+  const porMes = {};
+  const porTecnico = {};
+  const porRepuesto = {};
+  const porTipoTrabajo = {};
+  Object.keys(TIPOS_TRABAJO).forEach(k=> porTipoTrabajo[k] = {horasTotales:0, piezas:0});
+
+  let ingresosCompletados = 0;
+  let ordenesCompletadas = 0;
+  let ingresosTotales = 0;
+
+  state.orders.forEach(o=>{
+    const total = orderTotal(o);
+    ingresosTotales += total;
+
+    const mesKey = (o.fechaIngreso||'').slice(0,7) || 'sin-fecha';
+    if(!porMes[mesKey]) porMes[mesKey] = {count:0, total:0};
+    porMes[mesKey].count++; porMes[mesKey].total += total;
+
+    const tec = o.tecnico && o.tecnico.trim() ? o.tecnico.trim() : 'Sin asignar';
+    if(!porTecnico[tec]) porTecnico[tec] = {count:0, total:0};
+    porTecnico[tec].count++; porTecnico[tec].total += total;
+
+    if(o.estado==='terminado' || o.estado==='entregado'){ ordenesCompletadas++; ingresosCompletados += total; }
+
+    o.repuestos.forEach(r=>{
+      if(!porRepuesto[r.nombre]) porRepuesto[r.nombre] = {cantidad:0, monto:0};
+      porRepuesto[r.nombre].cantidad += Number(r.cantidad)||0;
+      porRepuesto[r.nombre].monto += (Number(r.cantidad)||0) * (Number(r.precioUnitario)||0);
+    });
+
+    o.trabajos.forEach(t=>{
+      const segTotal = t.procesos.reduce((a,p)=>a+(p.tiempoRealSeg||0),0);
+      if(porTipoTrabajo[t.tipo]){ porTipoTrabajo[t.tipo].horasTotales += segTotal/3600; porTipoTrabajo[t.tipo].piezas += 1; }
+    });
+  });
+
+  return {porMes, porTecnico, porRepuesto, porTipoTrabajo, ingresosTotales, ingresosCompletados, ordenesCompletadas, totalOrdenes: state.orders.length};
+}
+
+function mesLabel(mesKey){
+  if(mesKey==='sin-fecha') return 'Sin fecha';
+  const [y,m] = mesKey.split('-');
+  return MESES_LARGO[Number(m)-1] + ' ' + y;
+}
+
+function renderReports(){
+  const rep = buildReportData();
+
+  const mesesOrdenados = Object.keys(rep.porMes).sort().reverse();
+  const tecnicosOrdenados = Object.entries(rep.porTecnico).sort((a,b)=>b[1].total-a[1].total);
+  const repuestosOrdenados = Object.entries(rep.porRepuesto).sort((a,b)=>b[1].monto-a[1].monto).slice(0,10);
+
+  if(state.orders.length===0){
+    return emptyState('Todavía no hay datos para mostrar reportes.','Cuando registres órdenes de trabajo, aquí verás ingresos, técnicos y repuestos más usados.');
+  }
+
+  return `
+    <div class="kpi-row">
+      <div class="kpi-card"><div class="kpi-label">Ingresos totales (todas las órdenes)</div><div class="kpi-value accent">${fmtMoney(rep.ingresosTotales)}</div></div>
+      <div class="kpi-card"><div class="kpi-label">Ingresos de órdenes completadas</div><div class="kpi-value">${fmtMoney(rep.ingresosCompletados)}</div></div>
+      <div class="kpi-card"><div class="kpi-label">Órdenes completadas</div><div class="kpi-value">${rep.ordenesCompletadas} / ${rep.totalOrdenes}</div></div>
+      <div class="kpi-card"><div class="kpi-label">Repuesto más facturado</div><div class="kpi-value" style="font-size:15px;">${repuestosOrdenados[0] ? repuestosOrdenados[0][0] : '—'}</div></div>
+    </div>
+
+    <h2 class="section-title">Ingresos por mes</h2>
+    <div class="table-wrap" style="margin-bottom:24px;"><table>
+      <tr><th>Mes</th><th>Órdenes</th><th>Ingresos</th></tr>
+      ${mesesOrdenados.map(m=>`<tr><td>${mesLabel(m)}</td><td>${rep.porMes[m].count}</td><td>${fmtMoney(rep.porMes[m].total)}</td></tr>`).join('')}
+    </table></div>
+
+    <h2 class="section-title">Órdenes e ingresos por técnico</h2>
+    <div class="table-wrap" style="margin-bottom:24px;"><table>
+      <tr><th>Técnico</th><th>Órdenes</th><th>Ingresos generados</th></tr>
+      ${tecnicosOrdenados.map(([tec,d])=>`<tr><td>${tec}</td><td>${d.count}</td><td>${fmtMoney(d.total)}</td></tr>`).join('')}
+    </table></div>
+
+    <h2 class="section-title">Repuestos más usados (top 10)</h2>
+    ${repuestosOrdenados.length===0 ? '<div style="color:var(--text-dim);font-size:13px;margin-bottom:24px;">Aún no se han usado repuestos en ninguna orden.</div>' : `
+    <div class="table-wrap" style="margin-bottom:24px;"><table>
+      <tr><th>Repuesto</th><th>Cantidad usada</th><th>Monto facturado</th></tr>
+      ${repuestosOrdenados.map(([nombre,d])=>`<tr><td>${nombre}</td><td>${d.cantidad}</td><td>${fmtMoney(d.monto)}</td></tr>`).join('')}
+    </table></div>`}
+
+    <h2 class="section-title">Tiempo de mecanizado por tipo de trabajo</h2>
+    <div class="table-wrap"><table>
+      <tr><th>Tipo de trabajo</th><th>Piezas registradas</th><th>Horas totales</th><th>Promedio por pieza</th></tr>
+      ${Object.entries(rep.porTipoTrabajo).map(([tipo,d])=>`
+        <tr>
+          <td>${TIPOS_TRABAJO[tipo].label}</td>
+          <td>${d.piezas}</td>
+          <td>${d.horasTotales.toFixed(1)} h</td>
+          <td>${d.piezas>0 ? (d.horasTotales/d.piezas).toFixed(1) : '0.0'} h</td>
+        </tr>`).join('')}
+    </table></div>
+  `;
+}
+
 /* ---------------- USERS (solo admin) ---------------- */
 function renderUsers(){
   return `
@@ -661,11 +1064,12 @@ function renderUsers(){
       <button class="btn btn-primary" id="new-user-btn">+ Agregar usuario</button>
     </div>
     <div class="table-wrap"><table>
-      <tr><th>Nombre</th><th>Usuario</th><th>Rol</th><th></th></tr>
+      <tr><th>Nombre</th><th>Usuario</th><th>Correo</th><th>Rol</th><th></th></tr>
       ${state.users.map(u=>`
         <tr>
           <td>${u.nombre}</td>
           <td style="font-family:var(--mono)">${u.usuario}</td>
+          <td style="font-size:12px;color:var(--text-dim)">${u.correo||'—'}</td>
           <td><span class="role-pill ${u.rol==='admin'?'admin':''}">${u.rol==='admin'?'Admin':'Técnico'}</span></td>
           <td>
             <button class="btn-icon" data-edit-user="${u.id}" title="Editar">✎</button>
@@ -684,6 +1088,8 @@ function bindContentEvents(){
   const newOrderBtn = document.getElementById('new-order-btn');
   if(newOrderBtn) newOrderBtn.onclick = ()=> openOrderModal(null);
   document.querySelectorAll('[data-edit]').forEach(el=> el.onclick = (e)=>{ e.stopPropagation(); openOrderModal(el.getAttribute('data-edit')); });
+  document.querySelectorAll('[data-pdf]').forEach(el=> el.onclick = (e)=>{ e.stopPropagation(); const o = state.orders.find(x=>x.id===el.getAttribute('data-pdf')); if(o) generateOrderPDF(o); });
+  document.querySelectorAll('[data-notify]').forEach(el=> el.onclick = (e)=>{ e.stopPropagation(); const o = state.orders.find(x=>x.id===el.getAttribute('data-notify')); if(o) notifyClientWhatsApp(o); });
   document.querySelectorAll('[data-del]').forEach(el=> el.onclick = async (e)=>{
     e.stopPropagation();
     if(confirm('¿Eliminar esta orden de trabajo? Esta acción no se puede deshacer.')){
@@ -778,7 +1184,7 @@ function openUserModal(id){
     draft = JSON.parse(JSON.stringify(state.users.find(u=>u.id===id)));
     draft.password = '';
   } else {
-    draft = {id:uid(), nombre:'', usuario:'', password:'', rol:'tecnico'};
+    draft = {id:uid(), nombre:'', usuario:'', password:'', rol:'tecnico', pregunta:PREGUNTAS_SEGURIDAD[0], respuesta:'', correo:''};
   }
   state.modal = {type:'user', draft, editingId:id};
   render();
@@ -790,6 +1196,7 @@ function renderModal(){
   if(state.modal.type==='order') return renderOrderModal();
   if(state.modal.type==='inventory') return renderInventoryModal();
   if(state.modal.type==='user') return renderUserModal();
+  if(state.modal.type==='taller') return renderTallerModal();
   if(state.modal.type==='photo') return renderPhotoModal();
   return '';
 }
@@ -801,6 +1208,26 @@ function renderPhotoModal(){
       <button class="close-x" id="modal-close">✕</button>
       <h3>Foto de la pieza</h3>
       <img class="photo-modal-img" src="${state.modal.dataUrl}">
+    </div>
+  </div>`;
+}
+
+function renderTallerModal(){
+  const d = state.modal.draft;
+  return `
+  <div class="modal-backdrop" id="modal-backdrop">
+    <div class="modal" style="max-width:480px;">
+      <button class="close-x" id="modal-close">✕</button>
+      <h3>Datos del taller</h3>
+      <p style="font-size:12px;color:var(--text-dim);margin-bottom:14px;">Esta información aparece en los comprobantes PDF de las órdenes.</p>
+      <div class="field" style="margin-bottom:10px;"><label>Nombre del taller</label><input id="tl-nombre" value="${d.nombre||''}"></div>
+      <div class="field" style="margin-bottom:10px;"><label>Teléfono</label><input id="tl-telefono" value="${d.telefono||''}"></div>
+      <div class="field" style="margin-bottom:10px;"><label>Dirección</label><input id="tl-direccion" value="${d.direccion||''}"></div>
+      <div class="field" style="margin-bottom:14px;"><label>Código de país para WhatsApp (ej. 506 para Costa Rica)</label><input id="tl-codigopais" value="${d.codigoPais||''}" placeholder="506"></div>
+      <div class="modal-actions">
+        <button class="btn" id="modal-cancel">Cancelar</button>
+        <button class="btn btn-primary" id="modal-save-taller">Guardar</button>
+      </div>
     </div>
   </div>`;
 }
@@ -973,7 +1400,12 @@ function renderUserModal(){
       <h3>${state.modal.editingId? 'Editar usuario' : 'Nuevo usuario'}</h3>
       <div class="field" style="margin-bottom:10px;"><label>Nombre completo</label><input id="fu-nombre" value="${d.nombre}"></div>
       <div class="field" style="margin-bottom:10px;"><label>Usuario</label><input id="fu-usuario" value="${d.usuario}"></div>
+      <div class="field" style="margin-bottom:10px;"><label>Correo electrónico (para recuperar contraseña)</label><input type="email" id="fu-correo" value="${d.correo||''}" placeholder="correo@gmail.com"></div>
       <div class="field" style="margin-bottom:10px;"><label>${state.modal.editingId? 'Nueva contraseña (dejar en blanco para no cambiarla)':'Contraseña'}</label><input type="password" id="fu-password"></div>
+      <div class="field" style="margin-bottom:10px;"><label>Pregunta de seguridad (para recuperar contraseña)</label>
+        <select id="fu-pregunta">${PREGUNTAS_SEGURIDAD.map(p=>`<option ${d.pregunta===p?'selected':''}>${p}</option>`).join('')}</select>
+      </div>
+      <div class="field" style="margin-bottom:10px;"><label>Respuesta</label><input id="fu-respuesta" value="${d.respuesta||''}"></div>
       <div class="field" style="margin-bottom:14px;"><label>Rol</label>
         <select id="fu-rol" ${isSelf?'disabled title="No puedes cambiar tu propio rol"':''}>
           <option value="tecnico" ${d.rol==='tecnico'?'selected':''}>Técnico</option>
@@ -1001,6 +1433,7 @@ function bindModalEvents(){
   if(state.modal.type==='order') bindOrderModalEvents();
   if(state.modal.type==='inventory') bindInventoryModalEvents();
   if(state.modal.type==='user') bindUserModalEvents();
+  if(state.modal.type==='taller') bindTallerModalEvents();
 }
 
 function readOrderFormIntoDraft(){
@@ -1146,6 +1579,21 @@ function bindInventoryModalEvents(){
   };
 }
 
+function bindTallerModalEvents(){
+  const saveBtn = document.getElementById('modal-save-taller');
+  if(saveBtn) saveBtn.onclick = async ()=>{
+    state.taller = {
+      nombre: val('tl-nombre').trim() || 'RectiMotor',
+      telefono: val('tl-telefono').trim(),
+      direccion: val('tl-direccion').trim(),
+      codigoPais: val('tl-codigopais').trim()
+    };
+    await saveTaller();
+    state.modal = null;
+    render();
+  };
+}
+
 function bindUserModalEvents(){
   const saveBtn = document.getElementById('modal-save-user');
   if(saveBtn) saveBtn.onclick = async ()=>{
@@ -1159,6 +1607,9 @@ function bindUserModalEvents(){
 
     if(!nombre || !usuario){ errEl.textContent = 'Completa nombre y usuario.'; return; }
     if(!state.modal.editingId && !nuevaPass){ errEl.textContent = 'Ingresa una contraseña.'; return; }
+    const respuesta = val('fu-respuesta').trim();
+    const pregunta = val('fu-pregunta');
+    if(!respuesta){ errEl.textContent = 'Ingresa una respuesta a la pregunta de seguridad.'; return; }
     const dup = state.users.find(u => u.usuario.toLowerCase()===usuario.toLowerCase() && u.id!==d.id);
     if(dup){ errEl.textContent = 'Ese nombre de usuario ya existe.'; return; }
 
@@ -1171,6 +1622,8 @@ function bindUserModalEvents(){
     }
 
     d.nombre = nombre; d.usuario = usuario; d.rol = finalRol;
+    d.pregunta = pregunta; d.respuesta = respuesta;
+    d.correo = val('fu-correo').trim();
     if(nuevaPass) d.password = nuevaPass;
     else if(state.modal.editingId){ const existing = state.users.find(u=>u.id===d.id); d.password = existing.password; }
 
@@ -1189,12 +1642,6 @@ function bindUserModalEvents(){
   await loadAll();
   render();
 })();
-
-if('serviceWorker' in navigator){
-  window.addEventListener('load', ()=>{
-    navigator.serviceWorker.register('sw.js').catch(err=> console.log('SW no registrado:', err));
-  });
-}
 </script>
 </body>
 </html>
