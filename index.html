@@ -219,14 +219,21 @@ const ESTADO_LABEL = {pendiente:'Pendiente', en_proceso:'En proceso', terminado:
    3) localStorage del navegador -> cada dispositivo guarda lo suyo (modo actual) */
 function installSupabaseStorage(){
   const base = SUPABASE_URL.replace(/\/$/,'') + '/rest/v1/rectimotor_data';
-  const headers = {
+  const readHeaders = () => ({
     'apikey': SUPABASE_ANON_KEY,
     'Authorization': 'Bearer ' + SUPABASE_ANON_KEY,
     'Content-Type': 'application/json'
-  };
+  });
+  // Escritura: si hay sesión (login exitoso contra Supabase Auth), usamos ese token.
+  // Si no, cae al anon key, que la política de la base de datos ahora rechaza (así protegemos escritura/borrado).
+  const writeHeaders = () => ({
+    'apikey': SUPABASE_ANON_KEY,
+    'Authorization': 'Bearer ' + (state.supabaseAccessToken || SUPABASE_ANON_KEY),
+    'Content-Type': 'application/json'
+  });
   window.storage = {
     async get(key){
-      const res = await fetch(base + '?key=eq.' + encodeURIComponent(key) + '&select=value', {headers});
+      const res = await fetch(base + '?key=eq.' + encodeURIComponent(key) + '&select=value', {headers: readHeaders()});
       if(!res.ok) throw new Error('Error de red leyendo ' + key);
       const rows = await res.json();
       if(!rows.length) throw new Error('no encontrado');
@@ -235,25 +242,70 @@ function installSupabaseStorage(){
     async set(key, value){
       const res = await fetch(base, {
         method:'POST',
-        headers: Object.assign({}, headers, {'Prefer':'resolution=merge-duplicates'}),
+        headers: Object.assign(writeHeaders(), {'Prefer':'resolution=merge-duplicates'}),
         body: JSON.stringify({key, value, updated_at: new Date().toISOString()})
       });
-      if(!res.ok) throw new Error('Error de red guardando ' + key);
+      if(!res.ok) throw new Error('sin_permiso_' + res.status + '_guardando_' + key);
       return {key, value, shared:false};
     },
     async delete(key){
-      const res = await fetch(base + '?key=eq.' + encodeURIComponent(key), {method:'DELETE', headers});
-      if(!res.ok) throw new Error('Error de red borrando ' + key);
+      const res = await fetch(base + '?key=eq.' + encodeURIComponent(key), {method:'DELETE', headers: writeHeaders()});
+      if(!res.ok) throw new Error('sin_permiso_' + res.status + '_borrando_' + key);
       return {key, deleted:true, shared:false};
     },
     async list(prefix){
       const url = base + '?select=key' + (prefix ? ('&key=like.' + encodeURIComponent(prefix) + '*') : '');
-      const res = await fetch(url, {headers});
+      const res = await fetch(url, {headers: readHeaders()});
       if(!res.ok) throw new Error('Error de red listando llaves');
       const rows = await res.json();
       return {keys: rows.map(r=>r.key)};
     }
   };
+}
+
+let _ultimoAvisoPermiso = 0;
+function handleStorageError(e, accion){
+  console.error('Error ' + accion, e);
+  const msg = (e && e.message) || '';
+  const esPermiso = msg.includes('sin_permiso_401') || msg.includes('sin_permiso_403');
+  const ahora = Date.now();
+  if(ahora - _ultimoAvisoPermiso < 4000) return; // evita varias alertas seguidas
+  _ultimoAvisoPermiso = ahora;
+  if(esPermiso){
+    alert('No se pudo guardar en la nube (' + accion + '): tu cuenta no tiene permiso de escritura configurado en Supabase. Pide a tu administrador que cree tu acceso en el panel de Supabase (Authentication → Users), o cierra sesión y vuelve a entrar si ya te lo configuraron.');
+  } else {
+    alert('No se pudo guardar en la nube (' + accion + '). Revisa tu conexión a internet e intenta de nuevo.');
+  }
+}
+
+/* Convierte el "usuario" de la app en un correo sintético para Supabase Auth.
+   No necesita ser un correo real: solo sirve como identificador único de la cuenta. */
+function usuarioToSyntheticEmail(usuario){
+  const limpio = (usuario||'').toLowerCase().trim().replace(/[^a-z0-9._-]/g,'');
+  return limpio + '@rectimotor.local';
+}
+
+/* Intenta autenticar contra Supabase Auth para obtener permiso de ESCRITURA.
+   Si falla, el usuario sigue pudiendo entrar a la app (login local normal) y ver
+   los datos, pero no podrá guardar cambios hasta que un admin cree su cuenta
+   en el panel de Supabase (Authentication → Users). */
+async function supabaseAuthLogin(usuario, password){
+  if(!SUPABASE_CONFIGURADO) return {ok:true};
+  try{
+    const res = await fetch(SUPABASE_URL.replace(/\/$/,'') + '/auth/v1/token?grant_type=password', {
+      method:'POST',
+      headers:{'Content-Type':'application/json', 'apikey': SUPABASE_ANON_KEY},
+      body: JSON.stringify({ email: usuarioToSyntheticEmail(usuario), password })
+    });
+    const data = await res.json().catch(()=>null);
+    if(!res.ok || !data || !data.access_token){ state.supabaseAccessToken=null; state.supabaseRefreshToken=null; return {ok:false}; }
+    state.supabaseAccessToken = data.access_token;
+    state.supabaseRefreshToken = data.refresh_token;
+    return {ok:true};
+  }catch(e){
+    state.supabaseAccessToken=null; state.supabaseRefreshToken=null;
+    return {ok:false};
+  }
 }
 
 function installLocalStorageShim(){
@@ -305,18 +357,23 @@ let state = {
   orders:[],
   inventory:[],
   users:[],
+  clientes:[],
   taller:{nombre:'RectiMotor', telefono:'', direccion:'', codigoPais:'', correo:'', identificacion:'', logo:''},
   counters:{order:0},
   loaded:false,
   currentUser:null,
   loginForm:{usuario:'', password:'', error:''},
+  supabaseAccessToken:null,
+  supabaseRefreshToken:null,
   recovery:null, // {step:'find'|'answer'|'reset', usuario:'', user:null, error:''}
   openOrderIds:new Set(),
-  modal:null, // {type:'order'|'inventory'|'user'|'photo', draft:{...}, editingId}
+  openClienteIds:new Set(),
+  modal:null, // {type:'order'|'inventory'|'user'|'cliente'|'photo', draft:{...}, editingId}
   photoCache:{},      // trabajoId -> dataURL, fetched on demand
   photoFetching:new Set(),
   pendingPhotos:{},   // trabajoId -> dataURL not yet persisted to storage
-  searchQuery:''
+  searchQuery:'',
+  clienteSearchQuery:''
 };
 
 function uid(){ return 'id-' + Math.random().toString(36).slice(2,10) + Date.now().toString(36); }
@@ -331,21 +388,24 @@ async function loadAll(){
   try{ const r = await window.storage.get('counters', false); state.counters = r ? JSON.parse(r.value) : {order:0}; }catch(e){ state.counters = {order:0}; }
   try{ const r = await window.storage.get('users', false); state.users = r ? JSON.parse(r.value) : []; }catch(e){ state.users = []; }
   try{ const r = await window.storage.get('taller', false); state.taller = r ? JSON.parse(r.value) : {nombre:'RectiMotor', telefono:'', direccion:'', codigoPais:'', correo:'', identificacion:'', logo:''}; }catch(e){ state.taller = {nombre:'RectiMotor', telefono:'', direccion:'', codigoPais:'', correo:'', identificacion:'', logo:''}; }
+  try{ const r = await window.storage.get('clientes', false); state.clientes = r ? JSON.parse(r.value) : []; }catch(e){ state.clientes = []; }
   state.loaded = true;
 }
-async function saveUsers(){ try{ await window.storage.set('users', JSON.stringify(state.users), false); }catch(e){ console.error('Error guardando usuarios', e); } }
-async function saveTaller(){ try{ await window.storage.set('taller', JSON.stringify(state.taller), false); }catch(e){ console.error('Error guardando datos del taller', e); } }
+async function saveClientes(){ try{ await window.storage.set('clientes', JSON.stringify(state.clientes), false); }catch(e){ handleStorageError(e, 'guardando clientes'); } }
+async function saveUsers(){ try{ await window.storage.set('users', JSON.stringify(state.users), false); }catch(e){ handleStorageError(e, 'guardando usuarios'); } }
+async function saveTaller(){ try{ await window.storage.set('taller', JSON.stringify(state.taller), false); }catch(e){ handleStorageError(e, 'guardando datos del taller'); } }
 
 async function syncFromServer(){
   try{ const r = await window.storage.get('orders', false); state.orders = r ? JSON.parse(r.value) : []; }catch(e){ /* sin cambios */ }
   try{ const r = await window.storage.get('inventory', false); state.inventory = r ? JSON.parse(r.value) : []; }catch(e){ /* sin cambios */ }
   try{ const r = await window.storage.get('counters', false); state.counters = r ? JSON.parse(r.value) : state.counters; }catch(e){ /* sin cambios */ }
   try{ const r = await window.storage.get('taller', false); state.taller = r ? JSON.parse(r.value) : state.taller; }catch(e){ /* sin cambios */ }
+  try{ const r = await window.storage.get('clientes', false); state.clientes = r ? JSON.parse(r.value) : state.clientes; }catch(e){ /* sin cambios */ }
   // Los usuarios no se refrescan automáticamente para no cerrar sesiones activas por sorpresa.
 }
-async function saveOrders(){ try{ await window.storage.set('orders', JSON.stringify(state.orders), false); }catch(e){ console.error('Error guardando órdenes', e); } }
-async function saveInventory(){ try{ await window.storage.set('inventory', JSON.stringify(state.inventory), false); }catch(e){ console.error('Error guardando inventario', e); } }
-async function saveCounters(){ try{ await window.storage.set('counters', JSON.stringify(state.counters), false); }catch(e){ console.error('Error guardando contador', e); } }
+async function saveOrders(){ try{ await window.storage.set('orders', JSON.stringify(state.orders), false); }catch(e){ handleStorageError(e, 'guardando órdenes'); } }
+async function saveInventory(){ try{ await window.storage.set('inventory', JSON.stringify(state.inventory), false); }catch(e){ handleStorageError(e, 'guardando inventario'); } }
+async function saveCounters(){ try{ await window.storage.set('counters', JSON.stringify(state.counters), false); }catch(e){ handleStorageError(e, 'guardando contador'); } }
 
 async function exportData(){
   const fotos = {};
@@ -407,6 +467,29 @@ function orderTotal(o){
 }
 function orderSaldo(o){ return orderTotal(o) - (Number(o.abono)||0); }
 function lowStockItems(){ return state.inventory.filter(i => Number(i.stock) <= Number(i.stockMinimo)); }
+
+function diasEnTaller(o){
+  const f = new Date((o.fechaIngreso||'')+'T00:00:00');
+  if(isNaN(f.getTime())) return null;
+  const hoy = new Date(todayStr()+'T00:00:00');
+  return Math.round((hoy-f)/(1000*60*60*24));
+}
+
+function agingInfo(dias){
+  if(dias===null) return null;
+  if(dias>=90) return {label:dias+' días', color:'var(--danger)', urgente:true};
+  if(dias>=60) return {label:dias+' días', color:'var(--danger)', urgente:false};
+  if(dias>=30) return {label:dias+' días', color:'var(--warn)', urgente:false};
+  return null;
+}
+
+function reparacionesAtrasadas(){
+  return state.orders
+    .filter(o=> o.estado!=='entregado')
+    .map(o=>({order:o, dias: diasEnTaller(o)}))
+    .filter(x=> x.dias!==null && x.dias>=30)
+    .sort((a,b)=> b.dias - a.dias);
+}
 
 function generateOrderPDF(order){
   if(!window.jspdf || !window.jspdf.jsPDF){ alert('No se pudo cargar el generador de PDF. Revisa tu conexión a internet e intenta de nuevo.'); return; }
@@ -664,7 +747,9 @@ function render(){
       <div class="nav-item ${state.tab==='dashboard'?'active':''}" data-nav="dashboard"><span class="nav-icon">◆</span> Panel general</div>
       <div class="nav-item ${state.tab==='orders'?'active':''}" data-nav="orders"><span class="nav-icon">▤</span> Órdenes de trabajo</div>
       <div class="nav-item ${state.tab==='search'?'active':''}" data-nav="search"><span class="nav-icon">⌕</span> Buscar piezas / cajones</div>
+      <div class="nav-item ${state.tab==='clientes'?'active':''}" data-nav="clientes"><span class="nav-icon">☏</span> Cartera de clientes</div>
       <div class="nav-item ${state.tab==='inventory'?'active':''}" data-nav="inventory"><span class="nav-icon">▥</span> Inventario</div>
+      ${state.currentUser.rol==='admin' ? `<div class="nav-item ${state.tab==='credito'?'active':''}" data-nav="credito"><span class="nav-icon">₡</span> Cartera de crédito</div>` : ''}
       ${state.currentUser.rol==='admin' ? `<div class="nav-item ${state.tab==='reports'?'active':''}" data-nav="reports"><span class="nav-icon">▦</span> Reportes</div>` : ''}
       ${state.currentUser.rol==='admin' ? `<div class="nav-item ${state.tab==='users'?'active':''}" data-nav="users"><span class="nav-icon">☺</span> Usuarios</div>` : ''}
       <div class="sidebar-footer">
@@ -715,7 +800,9 @@ function render(){
   if(state.tab==='dashboard') content.innerHTML = renderDashboard();
   else if(state.tab==='orders') content.innerHTML = renderOrders();
   else if(state.tab==='search') content.innerHTML = renderSearch();
+  else if(state.tab==='clientes') content.innerHTML = renderClientes();
   else if(state.tab==='inventory') content.innerHTML = renderInventory();
+  else if(state.tab==='credito') content.innerHTML = state.currentUser.rol==='admin' ? renderCredito() : emptyState('Acceso restringido','Solo un administrador puede ver esta sección.');
   else if(state.tab==='reports') content.innerHTML = state.currentUser.rol==='admin' ? renderReports() : emptyState('Acceso restringido','Solo un administrador puede ver esta sección.');
   else if(state.tab==='users') content.innerHTML = state.currentUser.rol==='admin' ? renderUsers() : emptyState('Acceso restringido','Solo un administrador puede ver esta sección.');
 
@@ -724,7 +811,7 @@ function render(){
 }
 
 function tabTitle(){
-  return {dashboard:'Panel general', orders:'Órdenes de trabajo', search:'Buscar piezas y cajones', inventory:'Inventario de repuestos', reports:'Reportes', users:'Usuarios'}[state.tab];
+  return {dashboard:'Panel general', orders:'Órdenes de trabajo', search:'Buscar piezas y cajones', clientes:'Cartera de clientes', inventory:'Inventario de repuestos', credito:'Cartera de crédito', reports:'Reportes', users:'Usuarios'}[state.tab];
 }
 
 /* ---------------- AUTENTICACIÓN ---------------- */
@@ -769,6 +856,9 @@ function bindSetupEvents(){
     await saveUsers();
     state.currentUser = user;
     render();
+    if(SUPABASE_CONFIGURADO){
+      await supabaseAuthLogin(usuario, pass);
+    }
   };
 }
 
@@ -796,13 +886,18 @@ function bindLoginEvents(){
     state.loginForm = {usuario:'', password:'', error:''};
     state.currentUser = match;
     render();
+    if(SUPABASE_CONFIGURADO){
+      // Esto no bloquea el ingreso a la app: si falla, el usuario entra igual pero
+      // no podrá guardar cambios hasta que un admin configure su cuenta en Supabase.
+      await supabaseAuthLogin(usuario, pass);
+    }
   };
   document.getElementById('li-submit').onclick = doLogin;
   document.getElementById('li-password').onkeydown = (e)=>{ if(e.key==='Enter') doLogin(); };
   document.getElementById('li-usuario').onkeydown = (e)=>{ if(e.key==='Enter') doLogin(); };
   document.getElementById('forgot-link').onclick = ()=>{ state.recovery = {step:'find', usuario:'', user:null, error:''}; render(); };
 }
-function logout(){ state.currentUser = null; state.tab='dashboard'; render(); }
+function logout(){ state.currentUser = null; state.tab='dashboard'; state.supabaseAccessToken=null; state.supabaseRefreshToken=null; render(); }
 
 /* ---------------- RECUPERAR CONTRASEÑA ---------------- */
 function renderRecoveryScreen(){
@@ -949,6 +1044,8 @@ function renderDashboard(){
   const terminadosMes = state.orders.filter(o=>o.estado==='terminado'||o.estado==='entregado').length;
   const bajoStock = lowStockItems().length;
   const horasTotales = state.orders.reduce((acc,o)=> acc + o.trabajos.reduce((a2,t)=> a2 + t.procesos.reduce((a3,p)=>a3+(p.tiempoRealSeg||0),0),0), 0)/3600;
+  const atrasadas = reparacionesAtrasadas();
+  const criticas = atrasadas.filter(x=>x.dias>=90).length;
 
   const recientes = [...state.orders].sort((a,b)=> b.createdAt - a.createdAt).slice(0,5);
 
@@ -958,6 +1055,7 @@ function renderDashboard(){
       <div class="kpi-card"><div class="kpi-label">Terminadas / entregadas</div><div class="kpi-value">${terminadosMes}</div></div>
       <div class="kpi-card"><div class="kpi-label">Repuestos bajo stock mínimo</div><div class="kpi-value ${bajoStock>0?'warn':''}">${bajoStock}</div></div>
       <div class="kpi-card"><div class="kpi-label">Horas de mecanizado registradas</div><div class="kpi-value">${horasTotales.toFixed(1)}</div></div>
+      <div class="kpi-card"><div class="kpi-label">Reparaciones con +30 días</div><div class="kpi-value" style="color:${atrasadas.length>0?'var(--warn)':'inherit'};">${atrasadas.length}${criticas>0?` <span style="font-size:13px;color:var(--danger);">(${criticas} críticas)</span>`:''}</div></div>
     </div>
     <h2 class="section-title">Órdenes recientes</h2>
     ${recientes.length===0 ? emptyState('Aún no hay órdenes de trabajo.','Crea la primera orden desde la sección "Órdenes de trabajo".') : `
@@ -973,6 +1071,21 @@ function renderDashboard(){
           <td>${fmtDate(o.fechaEntrega)}</td>
         </tr>`).join('')}
     </table></div>`}
+    ${atrasadas.length>0 ? `
+      <h2 class="section-title" style="margin-top:24px">⏱ Reparaciones estancadas (+30 días sin entregar)</h2>
+      <div class="table-wrap"><table>
+        <tr><th>Folio</th><th>Cliente</th><th>Teléfono</th><th>Vehículo</th><th>Estado</th><th>Días en el taller</th><th></th></tr>
+        ${atrasadas.map(x=>`
+          <tr>
+            <td style="font-family:var(--mono)">${x.order.folio}</td>
+            <td>${x.order.cliente.nombre||'—'}</td>
+            <td>${x.order.cliente.telefono||'—'}</td>
+            <td>${[x.order.vehiculo.marca,x.order.vehiculo.modelo].filter(Boolean).join(' ')||'—'}</td>
+            <td><span class="status-badge status-${x.order.estado}">${ESTADO_LABEL[x.order.estado]}</span></td>
+            <td style="color:${agingInfo(x.dias).color};font-weight:600;">${x.dias>=90?'🔴 ':'⚠️ '}${x.dias} días</td>
+            <td>${x.order.cliente.telefono ? `<button class="btn btn-sm" data-notify="${x.order.id}">📲 Notificar</button>` : ''}</td>
+          </tr>`).join('')}
+      </table></div>` : ''}
     ${bajoStock>0 ? `
       <h2 class="section-title" style="margin-top:24px">Alertas de inventario</h2>
       <div class="table-wrap"><table>
@@ -1000,11 +1113,16 @@ function renderOrders(){
 function renderOrderCard(o){
   const open = state.openOrderIds.has(o.id);
   const totalHoras = o.trabajos.reduce((a,t)=>a+t.procesos.reduce((a2,p)=>a2+(p.tiempoRealSeg||0),0),0)/3600;
+  const dias = o.estado!=='entregado' ? diasEnTaller(o) : null;
+  const aging = agingInfo(dias);
   return `
   <div class="order-card">
     <div class="plate" data-toggle="${o.id}">
       <div class="plate-folio">${o.folio}<span>${o.cliente.nombre||'Sin cliente'} · ${o.vehiculo.marca||''} ${o.vehiculo.modelo||''}</span></div>
-      <span class="status-badge status-${o.estado}">${ESTADO_LABEL[o.estado]}</span>
+      <div style="display:flex;align-items:center;gap:8px;">
+        ${aging ? `<span class="status-badge" style="background:transparent;color:${aging.color};border:1px solid ${aging.color};">${aging.urgente?'🔴':'⏱'} ${aging.label}</span>` : ''}
+        <span class="status-badge status-${o.estado}">${ESTADO_LABEL[o.estado]}</span>
+      </div>
     </div>
     <div class="order-body ${open?'open':''}">
       <div class="order-meta">
@@ -1064,6 +1182,236 @@ function renderSearch(){
       `).join('')}
     </div>` : ''}
   `;
+}
+
+/* ---------------- CARTERA DE CLIENTES ---------------- */
+function ordersForClient(cliente){
+  const phoneDigits = (cliente.telefono||'').replace(/\D/g,'');
+  return state.orders.filter(o=>{
+    if(o.clienteId && o.clienteId===cliente.id) return true;
+    if(!o.clienteId){
+      const oPhone = (o.cliente.telefono||'').replace(/\D/g,'');
+      if(phoneDigits && oPhone && oPhone===phoneDigits) return true;
+      if(!phoneDigits && !oPhone && o.cliente.nombre && cliente.nombre && o.cliente.nombre.trim().toLowerCase()===cliente.nombre.trim().toLowerCase()) return true;
+    }
+    return false;
+  }).sort((a,b)=>b.createdAt-a.createdAt);
+}
+
+function renderClientes(){
+  const q = state.clienteSearchQuery.trim().toLowerCase();
+  let lista = state.clientes.map(c=>{
+    const ordenes = ordersForClient(c);
+    const totalFacturado = ordenes.reduce((a,o)=>a+orderTotal(o),0);
+    const saldoPendiente = ordenes.reduce((a,o)=>a+orderSaldo(o),0);
+    return {cliente:c, ordenes, totalFacturado, saldoPendiente};
+  });
+  if(q){
+    lista = lista.filter(x => (x.cliente.nombre+' '+(x.cliente.telefono||'')+' '+(x.cliente.correo||'')).toLowerCase().includes(q));
+  }
+  lista.sort((a,b)=> a.cliente.nombre.localeCompare(b.cliente.nombre));
+
+  return `
+    <div style="display:flex;justify-content:space-between;gap:12px;margin-bottom:14px;flex-wrap:wrap;">
+      <input id="cliente-search-input" placeholder="Buscar cliente por nombre, teléfono o correo…" value="${state.clienteSearchQuery}" style="max-width:360px;">
+      <button class="btn btn-primary" id="new-cliente-btn">+ Agregar cliente</button>
+    </div>
+    ${state.clientes.length===0 ? emptyState('Aún no tienes clientes registrados.','Agrega tus clientes para ver su historial de órdenes, cuánto han facturado y si tienen saldos pendientes.') : ''}
+    ${state.clientes.length>0 && lista.length===0 ? emptyState('Sin resultados.','Prueba con otro término de búsqueda.') : ''}
+    ${lista.map(x=>renderClienteCard(x)).join('')}
+  `;
+}
+
+function renderClienteCard(x){
+  const c = x.cliente;
+  const open = state.openClienteIds.has(c.id);
+  return `
+  <div class="order-card">
+    <div class="plate" data-toggle-cliente="${c.id}">
+      <div class="plate-folio">${c.nombre}<span>${c.telefono||'Sin teléfono'} ${c.correo? ' · '+c.correo : ''}</span></div>
+      <div style="display:flex;align-items:center;gap:14px;">
+        <span style="font-family:var(--mono);font-size:13px;color:var(--text-dim);">${x.ordenes.length} orden${x.ordenes.length===1?'':'es'}</span>
+        ${x.saldoPendiente>0 ? `<span class="status-badge" style="background:rgba(209,143,58,.18);color:var(--warn);border:1px solid var(--warn);">Debe ${fmtMoney(x.saldoPendiente)}</span>` : ''}
+      </div>
+    </div>
+    <div class="order-body ${open?'open':''}">
+      <div class="order-meta">
+        <div><span>Dirección</span>${c.direccion||'—'}</div>
+        <div><span>Identificación</span>${c.identificacion||'—'}</div>
+        <div><span>Total facturado</span>${fmtMoney(x.totalFacturado)}</div>
+        <div><span>Saldo pendiente</span><b style="color:${x.saldoPendiente>0?'var(--warn)':'var(--success)'};">${fmtMoney(x.saldoPendiente)}</b></div>
+      </div>
+      ${c.notas ? `<div style="font-size:13px;color:var(--text-dim);margin-bottom:10px;">${c.notas}</div>` : ''}
+      <h2 class="section-title" style="margin-top:10px;">Historial de órdenes</h2>
+      ${x.ordenes.length===0 ? '<div style="font-size:13px;color:var(--text-dim);margin-bottom:10px;">Este cliente aún no tiene órdenes registradas.</div>' : `
+      <div class="table-wrap" style="margin-bottom:10px;"><table>
+        <tr><th>Folio</th><th>Vehículo</th><th>Estado</th><th>Ingreso</th><th>Total</th><th>Saldo</th></tr>
+        ${x.ordenes.map(o=>`
+          <tr>
+            <td style="font-family:var(--mono)">${o.folio}</td>
+            <td>${[o.vehiculo.marca,o.vehiculo.modelo].filter(Boolean).join(' ')||'—'}</td>
+            <td><span class="status-badge status-${o.estado}">${ESTADO_LABEL[o.estado]}</span></td>
+            <td>${fmtDate(o.fechaIngreso)}</td>
+            <td>${fmtMoney(orderTotal(o))}</td>
+            <td style="color:${orderSaldo(o)>0?'var(--warn)':'var(--success)'};">${fmtMoney(orderSaldo(o))}</td>
+          </tr>`).join('')}
+      </table></div>`}
+      <div class="order-actions">
+        <button class="btn btn-sm" data-edit-cliente="${c.id}">Editar</button>
+        <button class="btn btn-sm btn-danger" data-del-cliente="${c.id}">Eliminar</button>
+      </div>
+    </div>
+  </div>`;
+}
+
+function openClienteModal(id){
+  let draft;
+  if(id){
+    draft = JSON.parse(JSON.stringify(state.clientes.find(c=>c.id===id)));
+  } else {
+    draft = {id:uid(), nombre:'', telefono:'', correo:'', direccion:'', identificacion:'', notas:'', createdAt:Date.now()};
+  }
+  state.modal = {type:'cliente', draft, editingId:id};
+  render();
+}
+
+function renderClienteModal(){
+  const d = state.modal.draft;
+  return `
+  <div class="modal-backdrop" id="modal-backdrop">
+    <div class="modal" style="max-width:520px;">
+      <button class="close-x" id="modal-close">✕</button>
+      <h3>${state.modal.editingId? 'Editar cliente' : 'Nuevo cliente'}</h3>
+      <div class="form-grid">
+        <div class="field"><label>Nombre completo</label><input id="cl-nombre" value="${d.nombre}"></div>
+        <div class="field"><label>Teléfono</label><input id="cl-telefono" value="${d.telefono||''}"></div>
+        <div class="field"><label>Correo electrónico</label><input type="email" id="cl-correo" value="${d.correo||''}"></div>
+        <div class="field"><label>Identificación (cédula)</label><input id="cl-identificacion" value="${d.identificacion||''}"></div>
+        <div class="field" style="grid-column:span 2;"><label>Dirección</label><input id="cl-direccion" value="${d.direccion||''}"></div>
+        <div class="field" style="grid-column:span 2;"><label>Notas</label><textarea id="cl-notas">${d.notas||''}</textarea></div>
+      </div>
+      <div id="cl-error" class="auth-error"></div>
+      <div class="modal-actions">
+        <button class="btn" id="modal-cancel">Cancelar</button>
+        <button class="btn btn-primary" id="modal-save-cliente">Guardar cliente</button>
+      </div>
+    </div>
+  </div>`;
+}
+
+function bindClienteModalEvents(){
+  const saveBtn = document.getElementById('modal-save-cliente');
+  if(saveBtn) saveBtn.onclick = async ()=>{
+    const d = state.modal.draft;
+    const errEl = document.getElementById('cl-error');
+    const nombre = val('cl-nombre').trim();
+    if(!nombre){ errEl.textContent = 'Ingresa el nombre del cliente.'; return; }
+    d.nombre = nombre;
+    d.telefono = val('cl-telefono').trim();
+    d.correo = val('cl-correo').trim();
+    d.identificacion = val('cl-identificacion').trim();
+    d.direccion = val('cl-direccion').trim();
+    d.notas = val('cl-notas').trim();
+    const idx = state.clientes.findIndex(c=>c.id===d.id);
+    if(idx>=0) state.clientes[idx]=d; else state.clientes.push(d);
+    await saveClientes();
+    state.modal = null;
+    render();
+  };
+}
+
+/* ---------------- CARTERA DE CRÉDITO ---------------- */
+function diasDesde(fechaStr){
+  if(!fechaStr) return null;
+  const f = new Date(fechaStr+'T00:00:00');
+  const hoy = new Date(todayStr()+'T00:00:00');
+  return Math.round((hoy-f)/(1000*60*60*24));
+}
+
+function renderCredito(){
+  const conSaldo = state.orders
+    .filter(o=>orderSaldo(o) > 0)
+    .sort((a,b)=> (diasDesde(b.fechaIngreso)||0) - (diasDesde(a.fechaIngreso)||0));
+
+  const totalPorCobrar = conSaldo.reduce((a,o)=>a+orderSaldo(o),0);
+
+  const porCliente = {};
+  conSaldo.forEach(o=>{
+    const key = o.cliente.nombre || 'Sin cliente';
+    porCliente[key] = (porCliente[key]||0) + orderSaldo(o);
+  });
+  const clienteQueMasDebe = Object.entries(porCliente).sort((a,b)=>b[1]-a[1])[0];
+
+  if(state.orders.length===0){
+    return emptyState('Todavía no hay órdenes registradas.','Cuando registres órdenes con abonos parciales, aquí verás quién te debe y cuánto.');
+  }
+
+  return `
+    <div class="kpi-row">
+      <div class="kpi-card"><div class="kpi-label">Total por cobrar</div><div class="kpi-value" style="color:${totalPorCobrar>0?'var(--warn)':'var(--success)'};">${fmtMoney(totalPorCobrar)}</div></div>
+      <div class="kpi-card"><div class="kpi-label">Órdenes con saldo pendiente</div><div class="kpi-value">${conSaldo.length}</div></div>
+      <div class="kpi-card"><div class="kpi-label">Cliente que más debe</div><div class="kpi-value" style="font-size:15px;">${clienteQueMasDebe ? clienteQueMasDebe[0]+' · '+fmtMoney(clienteQueMasDebe[1]) : '—'}</div></div>
+    </div>
+
+    ${conSaldo.length===0 ? emptyState('¡Al día! No hay saldos pendientes.','Todas las órdenes están totalmente pagadas.') : `
+    <div class="table-wrap"><table>
+      <tr><th>Cliente</th><th>Teléfono</th><th>Folio</th><th>Vehículo</th><th>Días</th><th>Total</th><th>Abono</th><th>Saldo</th><th></th></tr>
+      ${conSaldo.map(o=>{
+        const dias = diasDesde(o.fechaIngreso);
+        return `
+        <tr>
+          <td>${o.cliente.nombre||'—'}</td>
+          <td>${o.cliente.telefono||'—'}</td>
+          <td style="font-family:var(--mono)">${o.folio}</td>
+          <td>${[o.vehiculo.marca,o.vehiculo.modelo].filter(Boolean).join(' ')||'—'}</td>
+          <td class="${dias>30?'low-stock':''}">${dias!==null?dias+' d':'—'}</td>
+          <td>${fmtMoney(orderTotal(o))}</td>
+          <td>${fmtMoney(o.abono||0)}</td>
+          <td style="color:var(--warn);font-weight:600;">${fmtMoney(orderSaldo(o))}</td>
+          <td style="white-space:nowrap;">
+            <button class="btn btn-sm" data-registrar-abono="${o.id}">+ Abono</button>
+            ${o.cliente.telefono ? `<button class="btn-icon" data-notify="${o.id}" title="Notificar por WhatsApp">📲</button>` : ''}
+          </td>
+        </tr>`;
+      }).join('')}
+    </table></div>`}
+  `;
+}
+
+function renderAbonoModal(){
+  const d = state.modal.draft;
+  const saldoActual = orderSaldo(d.order);
+  return `
+  <div class="modal-backdrop" id="modal-backdrop">
+    <div class="modal" style="max-width:420px;">
+      <button class="close-x" id="modal-close">✕</button>
+      <h3>Registrar abono · ${d.order.folio}</h3>
+      <p style="font-size:13px;color:var(--text-dim);margin-bottom:14px;">Cliente: <b>${d.order.cliente.nombre||'—'}</b> · Saldo actual: <b style="color:var(--warn);">${fmtMoney(saldoActual)}</b></p>
+      <div class="field" style="margin-bottom:14px;"><label>Monto del abono</label><input type="number" min="0" id="ab-monto" placeholder="0"></div>
+      <div id="ab-error" class="auth-error"></div>
+      <div class="modal-actions">
+        <button class="btn" id="modal-cancel">Cancelar</button>
+        <button class="btn btn-primary" id="modal-save-abono">Registrar abono</button>
+      </div>
+    </div>
+  </div>`;
+}
+
+function bindAbonoModalEvents(){
+  const saveBtn = document.getElementById('modal-save-abono');
+  if(saveBtn) saveBtn.onclick = async ()=>{
+    const d = state.modal.draft;
+    const errEl = document.getElementById('ab-error');
+    const monto = Number(val('ab-monto'))||0;
+    if(monto<=0){ errEl.textContent = 'Ingresa un monto mayor a cero.'; return; }
+    const idx = state.orders.findIndex(o=>o.id===d.order.id);
+    if(idx>=0){
+      state.orders[idx].abono = (Number(state.orders[idx].abono)||0) + monto;
+      await saveOrders();
+    }
+    state.modal = null;
+    render();
+  };
 }
 
 /* ---------------- INVENTORY ---------------- */
@@ -1225,6 +1573,9 @@ function bindContentEvents(){
   document.querySelectorAll('[data-toggle]').forEach(el=>{
     el.onclick = ()=>{ const id = el.getAttribute('data-toggle'); state.openOrderIds.has(id)? state.openOrderIds.delete(id) : state.openOrderIds.add(id); render(); };
   });
+  document.querySelectorAll('[data-toggle-cliente]').forEach(el=>{
+    el.onclick = ()=>{ const id = el.getAttribute('data-toggle-cliente'); state.openClienteIds.has(id)? state.openClienteIds.delete(id) : state.openClienteIds.add(id); render(); };
+  });
   const newOrderBtn = document.getElementById('new-order-btn');
   if(newOrderBtn) newOrderBtn.onclick = ()=> openOrderModal(null);
   document.querySelectorAll('[data-edit]').forEach(el=> el.onclick = (e)=>{ e.stopPropagation(); openOrderModal(el.getAttribute('data-edit')); });
@@ -1263,6 +1614,27 @@ function bindContentEvents(){
     if(target.rol==='admin' && state.users.filter(u=>u.rol==='admin').length<=1){ alert('Debe existir al menos un usuario administrador.'); return; }
     if(confirm('¿Eliminar a '+target.nombre+'?')){ state.users = state.users.filter(u=>u.id!==id); await saveUsers(); render(); }
   });
+
+  const newClienteBtn = document.getElementById('new-cliente-btn');
+  if(newClienteBtn) newClienteBtn.onclick = ()=> openClienteModal(null);
+  document.querySelectorAll('[data-edit-cliente]').forEach(el=> el.onclick = (e)=>{ e.stopPropagation(); openClienteModal(el.getAttribute('data-edit-cliente')); });
+  document.querySelectorAll('[data-del-cliente]').forEach(el=> el.onclick = async (e)=>{
+    e.stopPropagation();
+    if(confirm('¿Eliminar este cliente de la cartera? Sus órdenes existentes no se borran.')){
+      state.clientes = state.clientes.filter(c=>c.id!==el.getAttribute('data-del-cliente'));
+      await saveClientes();
+      render();
+    }
+  });
+  const clienteSearchInput = document.getElementById('cliente-search-input');
+  if(clienteSearchInput){
+    clienteSearchInput.oninput = ()=>{ state.clienteSearchQuery = clienteSearchInput.value; render(); setTimeout(()=>{ const el=document.getElementById('cliente-search-input'); if(el){ el.focus(); el.selectionStart=el.selectionEnd=el.value.length; } },0); };
+  }
+
+  document.querySelectorAll('[data-registrar-abono]').forEach(el=> el.onclick = ()=>{
+    const order = state.orders.find(o=>o.id===el.getAttribute('data-registrar-abono'));
+    if(order) { state.modal = {type:'abono', draft:{order}}; render(); }
+  });
 }
 
 async function onResetData(){
@@ -1281,6 +1653,7 @@ function blankOrder(){
     id: uid(),
     folio: 'OT-' + String(state.counters.order).padStart(4,'0'),
     cliente:{nombre:'', telefono:''},
+    clienteId: null,
     vehiculo:{marca:'', modelo:'', anio:'', motor:''},
     tecnico:'',
     ubicacion:'',
@@ -1338,6 +1711,8 @@ function renderModal(){
   if(state.modal.type==='inventory') return renderInventoryModal();
   if(state.modal.type==='user') return renderUserModal();
   if(state.modal.type==='taller') return renderTallerModal();
+  if(state.modal.type==='cliente') return renderClienteModal();
+  if(state.modal.type==='abono') return renderAbonoModal();
   if(state.modal.type==='photo') return renderPhotoModal();
   return '';
 }
@@ -1401,12 +1776,22 @@ function renderOrderModal(){
       <h3>${state.modal.editingId? 'Editar orden '+d.folio : 'Nueva orden de trabajo · '+d.folio}</h3>
 
       <div class="form-grid cols-4">
+        <div class="field" style="grid-column:span 2;"><label>Cliente registrado (opcional)</label>
+          <select id="f-cliente-select">
+            <option value="">— Escribir cliente manualmente —</option>
+            ${state.clientes.map(c=>`<option value="${c.id}" ${d.clienteId===c.id?'selected':''}>${c.nombre}${c.telefono? ' · '+c.telefono : ''}</option>`).join('')}
+          </select>
+        </div>
+      </div>
+      <div class="form-grid cols-4">
         <div class="field"><label>Cliente</label><input id="f-cliente" value="${d.cliente.nombre}"></div>
         <div class="field"><label>Teléfono</label><input id="f-telefono" value="${d.cliente.telefono}"></div>
         <div class="field"><label>Técnico asignado</label><input id="f-tecnico" value="${d.tecnico}"></div>
         <div class="field"><label>Estado</label>
           <select id="f-estado">${ESTADOS_OT.map(s=>`<option value="${s}" ${d.estado===s?'selected':''}>${ESTADO_LABEL[s]}</option>`).join('')}</select>
         </div>
+      </div>
+      <div class="form-grid cols-4">
         <div class="field"><label>Marca vehículo</label><input id="f-marca" value="${d.vehiculo.marca}"></div>
         <div class="field"><label>Modelo</label><input id="f-modelo" value="${d.vehiculo.modelo}"></div>
         <div class="field"><label>Motor</label><input id="f-motor" value="${d.vehiculo.motor}" placeholder="ej. 1.6 16V"></div>
@@ -1494,12 +1879,16 @@ function renderTrabajoBlock(t, ti){
       ${photoData
         ? `<img src="${photoData}" class="photo-thumb" data-view-photo="${t.id}" title="Ver foto en grande">
            <div class="photo-actions">
-             <label class="btn btn-sm file-btn">Cambiar foto<input type="file" accept="image/*" data-photo-input="${ti}" hidden></label>
+             <label class="btn btn-sm file-btn">📷 Tomar foto<input type="file" accept="image/*" capture="environment" data-photo-input="${ti}" hidden></label>
+             <label class="btn btn-sm file-btn">🖼️ Galería<input type="file" accept="image/*" data-photo-input="${ti}" hidden></label>
              <button class="btn btn-sm btn-danger" data-photo-remove="${ti}">Quitar foto</button>
            </div>`
         : (t.tieneFoto
             ? `<div class="time-display">Cargando foto…</div>`
-            : `<label class="btn btn-sm file-btn">📷 Agregar foto de la pieza<input type="file" accept="image/*" data-photo-input="${ti}" hidden></label>`)
+            : `<div class="photo-actions">
+                 <label class="btn btn-sm file-btn">📷 Tomar foto<input type="file" accept="image/*" capture="environment" data-photo-input="${ti}" hidden></label>
+                 <label class="btn btn-sm file-btn">🖼️ Elegir de galería<input type="file" accept="image/*" data-photo-input="${ti}" hidden></label>
+               </div>`)
       }
     </div>
     ${t.procesos.map((p,pi)=>`
@@ -1595,6 +1984,8 @@ function bindModalEvents(){
   if(state.modal.type==='inventory') bindInventoryModalEvents();
   if(state.modal.type==='user') bindUserModalEvents();
   if(state.modal.type==='taller') bindTallerModalEvents();
+  if(state.modal.type==='cliente') bindClienteModalEvents();
+  if(state.modal.type==='abono') bindAbonoModalEvents();
 }
 
 function readOrderFormIntoDraft(){
@@ -1612,6 +2003,19 @@ function val(id){ const el = document.getElementById(id); return el ? el.value :
 
 function bindOrderModalEvents(){
   const d = state.modal.draft;
+
+  const clienteSelect = document.getElementById('f-cliente-select');
+  if(clienteSelect) clienteSelect.onchange = ()=>{
+    readOrderFormIntoDraft();
+    const selId = clienteSelect.value;
+    if(selId){
+      const c = state.clientes.find(x=>x.id===selId);
+      if(c){ d.clienteId = c.id; d.cliente.nombre = c.nombre; d.cliente.telefono = c.telefono||''; }
+    } else {
+      d.clienteId = null;
+    }
+    render();
+  };
 
   document.querySelectorAll('[data-add-trabajo]').forEach(el=>{
     el.onclick = ()=>{
