@@ -42,6 +42,7 @@
   .nav-item.active{color:var(--text);background:var(--panel-alt);border-left-color:var(--accent);}
   .nav-icon{font-family:var(--mono);font-size:13px;width:16px;text-align:center;color:var(--accent);}
   .sidebar-footer{margin-top:auto;padding:14px 20px 0 20px;border-top:1px solid var(--border);font-size:11px;color:var(--text-dim);}
+  .sync-status{margin-bottom:8px;}
   .reset-link{color:var(--danger);cursor:pointer;text-decoration:underline;font-size:11px;}
 
   /* Main */
@@ -52,7 +53,7 @@
   .content{padding:24px 28px;overflow-y:auto;flex:1;}
 
   /* KPI cards */
-  .kpi-row{display:grid;grid-template-columns:repeat(4,1fr);gap:14px;margin-bottom:24px;}
+  .kpi-row{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:14px;margin-bottom:24px;}
   .kpi-card{background:var(--panel);border:1px solid var(--border);border-radius:var(--radius);padding:16px 18px;}
   .kpi-label{font-size:11px;text-transform:uppercase;letter-spacing:1px;color:var(--text-dim);margin-bottom:8px;}
   .kpi-value{font-family:var(--mono);font-size:26px;font-weight:600;}
@@ -170,6 +171,17 @@ const EMAILJS_TEMPLATE_ID = 'TU_TEMPLATE_ID';
 const EMAILJS_CONFIGURADO = !EMAILJS_PUBLIC_KEY.startsWith('TU_') && !EMAILJS_SERVICE_ID.startsWith('TU_') && !EMAILJS_TEMPLATE_ID.startsWith('TU_');
 if(EMAILJS_CONFIGURADO && window.emailjs){ window.emailjs.init(EMAILJS_PUBLIC_KEY); }
 
+/* ==== CONFIGURACIÓN DE SUPABASE (multi-dispositivo con un solo servidor central) ====
+   Si completas estos 2 valores con los de tu proyecto gratuito en supabase.com,
+   TODOS los dispositivos que abran esta misma app verán los mismos datos en
+   tiempo casi-real (en vez de que cada celular/PC guarde los suyos por separado).
+   Mientras digan "TU_...", la app sigue funcionando en modo "cada dispositivo
+   guarda lo suyo" (como hasta ahora). */
+const SUPABASE_URL = 'https://usbnablmjmcmepueosmg.supabase.co';
+const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InVzYm5hYmxtam1jbWVwdWVvc21nIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODMzMDgxODAsImV4cCI6MjA5ODg4NDE4MH0.J1H77BwPG2JHPYEvFtPzilMImKYK1JVitnagZb2Eyhc';
+const SUPABASE_CONFIGURADO = !SUPABASE_URL.startsWith('TU_') && !SUPABASE_ANON_KEY.startsWith('TU_');
+const SUPABASE_POLL_MS = 15000; // cada cuánto revisa cambios de otros dispositivos
+
 const PREGUNTAS_SEGURIDAD = [
   '¿Cuál es el nombre de tu primera mascota?',
   '¿En qué ciudad naciste?',
@@ -186,11 +198,50 @@ const TIPOS_TRABAJO = {
 const ESTADOS_OT = ['pendiente','en_proceso','terminado','entregado'];
 const ESTADO_LABEL = {pendiente:'Pendiente', en_proceso:'En proceso', terminado:'Terminado', entregado:'Entregado'};
 
-/* Si se abre este archivo fuera de Claude.ai (doble clic en la PC), window.storage no existe.
-   En ese caso usamos localStorage del navegador como respaldo, para que la app funcione
-   como programa independiente en cada computadora. */
-(function installStorageShim(){
-  if(window.storage && typeof window.storage.get === 'function') return;
+/* Prioridad de almacenamiento:
+   1) window.storage nativo de Claude.ai (solo mientras se previsualiza aquí)
+   2) Supabase, si SUPABASE_URL/SUPABASE_ANON_KEY están configurados -> multi-dispositivo real
+   3) localStorage del navegador -> cada dispositivo guarda lo suyo (modo actual) */
+function installSupabaseStorage(){
+  const base = SUPABASE_URL.replace(/\/$/,'') + '/rest/v1/rectimotor_data';
+  const headers = {
+    'apikey': SUPABASE_ANON_KEY,
+    'Authorization': 'Bearer ' + SUPABASE_ANON_KEY,
+    'Content-Type': 'application/json'
+  };
+  window.storage = {
+    async get(key){
+      const res = await fetch(base + '?key=eq.' + encodeURIComponent(key) + '&select=value', {headers});
+      if(!res.ok) throw new Error('Error de red leyendo ' + key);
+      const rows = await res.json();
+      if(!rows.length) throw new Error('no encontrado');
+      return {key, value: rows[0].value, shared:false};
+    },
+    async set(key, value){
+      const res = await fetch(base, {
+        method:'POST',
+        headers: Object.assign({}, headers, {'Prefer':'resolution=merge-duplicates'}),
+        body: JSON.stringify({key, value, updated_at: new Date().toISOString()})
+      });
+      if(!res.ok) throw new Error('Error de red guardando ' + key);
+      return {key, value, shared:false};
+    },
+    async delete(key){
+      const res = await fetch(base + '?key=eq.' + encodeURIComponent(key), {method:'DELETE', headers});
+      if(!res.ok) throw new Error('Error de red borrando ' + key);
+      return {key, deleted:true, shared:false};
+    },
+    async list(prefix){
+      const url = base + '?select=key' + (prefix ? ('&key=like.' + encodeURIComponent(prefix) + '*') : '');
+      const res = await fetch(url, {headers});
+      if(!res.ok) throw new Error('Error de red listando llaves');
+      const rows = await res.json();
+      return {keys: rows.map(r=>r.key)};
+    }
+  };
+}
+
+function installLocalStorageShim(){
   const PREFIX = 'rectimotor:';
   window.storage = {
     get(key){
@@ -226,6 +277,12 @@ const ESTADO_LABEL = {pendiente:'Pendiente', en_proceso:'En proceso', terminado:
       });
     }
   };
+}
+
+(function installStorageBackend(){
+  if(window.storage && typeof window.storage.get === 'function') return; // ya en Claude.ai
+  if(SUPABASE_CONFIGURADO){ installSupabaseStorage(); return; }
+  installLocalStorageShim();
 })();
 
 let state = {
@@ -233,7 +290,7 @@ let state = {
   orders:[],
   inventory:[],
   users:[],
-  taller:{nombre:'RectiMotor', telefono:'', direccion:'', codigoPais:''},
+  taller:{nombre:'RectiMotor', telefono:'', direccion:'', codigoPais:'', correo:'', identificacion:''},
   counters:{order:0},
   loaded:false,
   currentUser:null,
@@ -258,11 +315,19 @@ async function loadAll(){
   try{ const r = await window.storage.get('inventory', false); state.inventory = r ? JSON.parse(r.value) : []; }catch(e){ state.inventory = []; }
   try{ const r = await window.storage.get('counters', false); state.counters = r ? JSON.parse(r.value) : {order:0}; }catch(e){ state.counters = {order:0}; }
   try{ const r = await window.storage.get('users', false); state.users = r ? JSON.parse(r.value) : []; }catch(e){ state.users = []; }
-  try{ const r = await window.storage.get('taller', false); state.taller = r ? JSON.parse(r.value) : {nombre:'RectiMotor', telefono:'', direccion:'', codigoPais:''}; }catch(e){ state.taller = {nombre:'RectiMotor', telefono:'', direccion:'', codigoPais:''}; }
+  try{ const r = await window.storage.get('taller', false); state.taller = r ? JSON.parse(r.value) : {nombre:'RectiMotor', telefono:'', direccion:'', codigoPais:'', correo:'', identificacion:''}; }catch(e){ state.taller = {nombre:'RectiMotor', telefono:'', direccion:'', codigoPais:'', correo:'', identificacion:''}; }
   state.loaded = true;
 }
 async function saveUsers(){ try{ await window.storage.set('users', JSON.stringify(state.users), false); }catch(e){ console.error('Error guardando usuarios', e); } }
 async function saveTaller(){ try{ await window.storage.set('taller', JSON.stringify(state.taller), false); }catch(e){ console.error('Error guardando datos del taller', e); } }
+
+async function syncFromServer(){
+  try{ const r = await window.storage.get('orders', false); state.orders = r ? JSON.parse(r.value) : []; }catch(e){ /* sin cambios */ }
+  try{ const r = await window.storage.get('inventory', false); state.inventory = r ? JSON.parse(r.value) : []; }catch(e){ /* sin cambios */ }
+  try{ const r = await window.storage.get('counters', false); state.counters = r ? JSON.parse(r.value) : state.counters; }catch(e){ /* sin cambios */ }
+  try{ const r = await window.storage.get('taller', false); state.taller = r ? JSON.parse(r.value) : state.taller; }catch(e){ /* sin cambios */ }
+  // Los usuarios no se refrescan automáticamente para no cerrar sesiones activas por sorpresa.
+}
 async function saveOrders(){ try{ await window.storage.set('orders', JSON.stringify(state.orders), false); }catch(e){ console.error('Error guardando órdenes', e); } }
 async function saveInventory(){ try{ await window.storage.set('inventory', JSON.stringify(state.inventory), false); }catch(e){ console.error('Error guardando inventario', e); } }
 async function saveCounters(){ try{ await window.storage.set('counters', JSON.stringify(state.counters), false); }catch(e){ console.error('Error guardando contador', e); } }
@@ -325,6 +390,7 @@ function orderTotal(o){
   const repSum = o.repuestos.reduce((a,r)=>a + r.cantidad*r.precioUnitario, 0);
   return repSum + (Number(o.manoObra)||0);
 }
+function orderSaldo(o){ return orderTotal(o) - (Number(o.abono)||0); }
 function lowStockItems(){ return state.inventory.filter(i => Number(i.stock) <= Number(i.stockMinimo)); }
 
 function generateOrderPDF(order){
@@ -340,7 +406,12 @@ function generateOrderPDF(order){
   doc.setFont('helvetica','normal'); doc.setFontSize(9); doc.setTextColor(90);
   y += 6;
   if(state.taller.direccion){ doc.text(state.taller.direccion, marginX, y); y += 5; }
-  if(state.taller.telefono){ doc.text('Tel: ' + state.taller.telefono, marginX, y); y += 5; }
+  const contacto = [
+    state.taller.telefono ? ('Tel: ' + state.taller.telefono) : null,
+    state.taller.correo ? state.taller.correo : null
+  ].filter(Boolean).join('   ·   ');
+  if(contacto){ doc.text(contacto, marginX, y); y += 5; }
+  if(state.taller.identificacion){ doc.text('Id. fiscal: ' + state.taller.identificacion, marginX, y); y += 5; }
   doc.setTextColor(0);
 
   doc.setFont('helvetica','bold'); doc.setFontSize(12);
@@ -416,6 +487,16 @@ function generateOrderPDF(order){
   doc.setFont('helvetica','bold'); doc.setFontSize(11);
   doc.text('Total:', pageW - marginX - 50, y);
   doc.text(fmtMoney(orderTotal(order)), pageW - marginX, y, {align:'right'});
+
+  if(order.abono>0){
+    y += 7;
+    doc.setFont('helvetica','normal'); doc.setFontSize(9);
+    doc.text('Abono recibido:', pageW - marginX - 50, y);
+    doc.text('-' + fmtMoney(order.abono), pageW - marginX, y, {align:'right'}); y += 6;
+    doc.setFont('helvetica','bold'); doc.setFontSize(11);
+    doc.text('Saldo pendiente:', pageW - marginX - 50, y);
+    doc.text(fmtMoney(orderSaldo(order)), pageW - marginX, y, {align:'right'});
+  }
 
   if(order.notas){
     y += 10;
@@ -545,7 +626,11 @@ function render(){
       ${state.currentUser.rol==='admin' ? `<div class="nav-item ${state.tab==='users'?'active':''}" data-nav="users"><span class="nav-icon">☺</span> Usuarios</div>` : ''}
       <div class="sidebar-footer">
         <div class="user-badge">${state.currentUser.nombre} <span class="role-pill ${state.currentUser.rol==='admin'?'admin':''}">${state.currentUser.rol==='admin'?'Admin':'Técnico'}</span></div>
-        Datos y fotos guardados en esta computadora.<br>
+        <div class="sync-status">
+          ${SUPABASE_CONFIGURADO
+            ? `🟢 Sincronizado en la nube <span class="reset-link" id="sync-now-btn" style="color:var(--accent);">(actualizar ahora)</span>`
+            : `⚪ Modo local (datos solo en este dispositivo)`}
+        </div>
         <span class="reset-link" id="export-btn" style="color:var(--accent);">Exportar datos</span>
         ${state.currentUser.rol==='admin' ? ` · <span class="reset-link" id="import-btn" style="color:var(--accent);">Importar datos</span>` : ''}
         <br>
@@ -575,6 +660,8 @@ function render(){
   const importInput = document.getElementById('import-file-input');
   if(importInput) importInput.onchange = function(){ handleImportFile(this); };
   document.getElementById('logout-btn').onclick = logout;
+  const syncBtn = document.getElementById('sync-now-btn');
+  if(syncBtn) syncBtn.onclick = async ()=>{ syncBtn.textContent = '(actualizando…)'; await syncFromServer(); render(); };
   const tallerBtn = document.getElementById('taller-btn');
   if(tallerBtn) tallerBtn.onclick = ()=>{ state.modal = {type:'taller', draft: JSON.parse(JSON.stringify(state.taller))}; render(); };
 
@@ -884,7 +971,10 @@ function renderOrderCard(o){
         ${o.trabajos.map(t=>`<span class="work-tag">${TIPOS_TRABAJO[t.tipo].label}: ${t.procesos.filter(p=>p.estado==='terminado').length}/${t.procesos.length} procesos</span>`).join('') || '<span class="work-tag">Sin trabajos asignados</span>'}
       </div>
       <div><span style="color:var(--text-dim);font-size:11px;text-transform:uppercase">Repuestos:</span> ${o.repuestos.length? o.repuestos.map(r=>r.nombre+' x'+r.cantidad).join(', ') : 'ninguno'}</div>
-      <div style="margin-top:8px;font-family:var(--mono);font-size:14px;">Total estimado: <b>${fmtMoney(orderTotal(o))}</b></div>
+      <div style="margin-top:8px;font-family:var(--mono);font-size:14px;">
+        Total estimado: <b>${fmtMoney(orderTotal(o))}</b>
+        ${(o.abono>0) ? ` &nbsp;·&nbsp; Abono: ${fmtMoney(o.abono)} &nbsp;·&nbsp; Saldo: <b style="color:${orderSaldo(o)>0?'var(--warn)':'var(--success)'};">${fmtMoney(orderSaldo(o))}</b>` : ''}
+      </div>
       <div class="order-actions">
         <button class="btn btn-sm" data-edit="${o.id}">Editar</button>
         <button class="btn btn-sm" data-pdf="${o.id}">📄 Comprobante PDF</button>
@@ -969,6 +1059,7 @@ function buildReportData(){
   let ingresosCompletados = 0;
   let ordenesCompletadas = 0;
   let ingresosTotales = 0;
+  let saldoPendienteTotal = 0;
 
   state.orders.forEach(o=>{
     const total = orderTotal(o);
@@ -983,6 +1074,7 @@ function buildReportData(){
     porTecnico[tec].count++; porTecnico[tec].total += total;
 
     if(o.estado==='terminado' || o.estado==='entregado'){ ordenesCompletadas++; ingresosCompletados += total; }
+    saldoPendienteTotal += orderSaldo(o);
 
     o.repuestos.forEach(r=>{
       if(!porRepuesto[r.nombre]) porRepuesto[r.nombre] = {cantidad:0, monto:0};
@@ -996,7 +1088,7 @@ function buildReportData(){
     });
   });
 
-  return {porMes, porTecnico, porRepuesto, porTipoTrabajo, ingresosTotales, ingresosCompletados, ordenesCompletadas, totalOrdenes: state.orders.length};
+  return {porMes, porTecnico, porRepuesto, porTipoTrabajo, ingresosTotales, ingresosCompletados, ordenesCompletadas, totalOrdenes: state.orders.length, saldoPendienteTotal};
 }
 
 function mesLabel(mesKey){
@@ -1022,6 +1114,7 @@ function renderReports(){
       <div class="kpi-card"><div class="kpi-label">Ingresos de órdenes completadas</div><div class="kpi-value">${fmtMoney(rep.ingresosCompletados)}</div></div>
       <div class="kpi-card"><div class="kpi-label">Órdenes completadas</div><div class="kpi-value">${rep.ordenesCompletadas} / ${rep.totalOrdenes}</div></div>
       <div class="kpi-card"><div class="kpi-label">Repuesto más facturado</div><div class="kpi-value" style="font-size:15px;">${repuestosOrdenados[0] ? repuestosOrdenados[0][0] : '—'}</div></div>
+      <div class="kpi-card"><div class="kpi-label">Saldos pendientes por cobrar</div><div class="kpi-value" style="color:${rep.saldoPendienteTotal>0?'var(--warn)':'var(--success)'};">${fmtMoney(rep.saldoPendienteTotal)}</div></div>
     </div>
 
     <h2 class="section-title">Ingresos por mes</h2>
@@ -1150,6 +1243,7 @@ function blankOrder(){
     trabajos:[],
     repuestos:[],
     manoObra:0,
+    abono:0,
     notas:'',
     createdAt: Date.now()
   };
@@ -1222,7 +1316,9 @@ function renderTallerModal(){
       <p style="font-size:12px;color:var(--text-dim);margin-bottom:14px;">Esta información aparece en los comprobantes PDF de las órdenes.</p>
       <div class="field" style="margin-bottom:10px;"><label>Nombre del taller</label><input id="tl-nombre" value="${d.nombre||''}"></div>
       <div class="field" style="margin-bottom:10px;"><label>Teléfono</label><input id="tl-telefono" value="${d.telefono||''}"></div>
+      <div class="field" style="margin-bottom:10px;"><label>Correo electrónico</label><input type="email" id="tl-correo" value="${d.correo||''}"></div>
       <div class="field" style="margin-bottom:10px;"><label>Dirección</label><input id="tl-direccion" value="${d.direccion||''}"></div>
+      <div class="field" style="margin-bottom:10px;"><label>Cédula jurídica / RUC / identificación fiscal</label><input id="tl-identificacion" value="${d.identificacion||''}"></div>
       <div class="field" style="margin-bottom:14px;"><label>Código de país para WhatsApp (ej. 506 para Costa Rica)</label><input id="tl-codigopais" value="${d.codigoPais||''}" placeholder="506"></div>
       <div class="modal-actions">
         <button class="btn" id="modal-cancel">Cancelar</button>
@@ -1236,6 +1332,7 @@ function renderOrderModal(){
   const d = state.modal.draft;
   const repSubtotal = d.repuestos.reduce((a,r)=>a+r.cantidad*r.precioUnitario,0);
   const total = repSubtotal + (Number(d.manoObra)||0);
+  const saldo = total - (Number(d.abono)||0);
   return `
   <div class="modal-backdrop" id="modal-backdrop">
     <div class="modal">
@@ -1294,13 +1391,16 @@ function renderOrderModal(){
       </div>
 
       <hr class="divider">
-      <div class="form-grid">
+      <div class="form-grid cols-4">
         <div class="field"><label>Costo de mano de obra</label><input type="number" min="0" id="f-manoobra" value="${d.manoObra}"></div>
-        <div class="field"><label>Notas</label><textarea id="f-notas">${d.notas}</textarea></div>
+        <div class="field"><label>Abono / adelanto</label><input type="number" min="0" id="f-abono" value="${d.abono||0}"></div>
+        <div class="field" style="grid-column: span 2;"><label>Notas</label><textarea id="f-notas">${d.notas}</textarea></div>
       </div>
       <div class="totals">
         <div><div class="t-label">Repuestos</div><div class="t-value">${fmtMoney(repSubtotal)}</div></div>
         <div><div class="t-label">Total orden</div><div class="t-value">${fmtMoney(total)}</div></div>
+        <div><div class="t-label">Abono</div><div class="t-value">${fmtMoney(d.abono||0)}</div></div>
+        <div><div class="t-label">Saldo pendiente</div><div class="t-value" style="color:${saldo>0?'var(--warn)':'var(--success)'};">${fmtMoney(saldo)}</div></div>
       </div>
 
       <div class="modal-actions">
@@ -1445,6 +1545,7 @@ function readOrderFormIntoDraft(){
   d.fechaIngreso = val('f-fingreso'); d.fechaEntrega = val('f-fentrega');
   d.ubicacion = val('f-ubicacion');
   d.manoObra = Number(val('f-manoobra'))||0; d.notas = val('f-notas');
+  d.abono = Number(val('f-abono'))||0;
 }
 function val(id){ const el = document.getElementById(id); return el ? el.value : ''; }
 
@@ -1585,7 +1686,9 @@ function bindTallerModalEvents(){
     state.taller = {
       nombre: val('tl-nombre').trim() || 'RectiMotor',
       telefono: val('tl-telefono').trim(),
+      correo: val('tl-correo').trim(),
       direccion: val('tl-direccion').trim(),
+      identificacion: val('tl-identificacion').trim(),
       codigoPais: val('tl-codigopais').trim()
     };
     await saveTaller();
@@ -1641,6 +1744,17 @@ function bindUserModalEvents(){
   render();
   await loadAll();
   render();
+
+  if(SUPABASE_CONFIGURADO){
+    setInterval(async ()=>{
+      // Solo sincroniza en segundo plano si no hay un modal abierto (para no interrumpir una edición)
+      // y si ya se inició sesión (para no pisar la pantalla de login/config inicial).
+      if(state.currentUser && !state.modal){
+        await syncFromServer();
+        render();
+      }
+    }, SUPABASE_POLL_MS);
+  }
 })();
 </script>
 </body>
